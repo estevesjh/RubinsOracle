@@ -1,0 +1,42 @@
+name: neural_prophet
+lag_days: 72
+n_forecast: 48
+
+# Seasonality
+yearly_seasonality: false
+weekly_seasonality: true
+daily_seasonality: true
+seasonality_mode: additive
+
+# Trend
+growth: linear
+n_changepoints: 20
+changepoints_range: 0.9
+
+# AR configuration with deeper network
+ar_layers:
+  - 128
+  - 64
+  - 32
+ar_reg: 0.5
+
+# Trend regularization
+trend_reg: 0.5
+
+# Training (more epochs for deeper network)
+epochs: 30
+batch_size: 64
+learning_rate: 0.001
+loss_func: SmoothL1Loss
+optimizer: AdamW
+
+# Uncertainty quantiles
+quantiles:
+  - 0.05
+  - 0.16
+  - 0.84
+  - 0.95
+
+# Data handling
+drop_missing: false
+impute_missing: true
