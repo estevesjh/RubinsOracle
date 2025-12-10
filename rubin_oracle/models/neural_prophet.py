@@ -73,10 +73,10 @@ class NeuralProphetForecaster:
         # Validate input
         df = validate_input(df)
 
-        # Prepare data with regular frequency
+        # Prepare data with regular frequency from config
         df = prepare_regular_frequency(
             df,
-            freq='h',
+            freq=self.config.freq,
             interpolate=self.config.impute_missing
         )
 
@@ -114,8 +114,8 @@ class NeuralProphetForecaster:
             # This creates a non-linear AR component
             pass
 
-        # Fit the model (suppress output with verbose=False or minimal)
-        self.model_.fit(df, freq='h')
+        # Fit the model with configured frequency
+        self.model_.fit(df, freq=self.config.freq)
 
         return self
 
@@ -154,11 +154,11 @@ class NeuralProphetForecaster:
                 "Please provide df with at least lag_days of historical data."
             )
 
-        # Validate and prepare input
+        # Validate and prepare input with configured frequency
         df = validate_input(df)
         df = prepare_regular_frequency(
             df,
-            freq='h',
+            freq=self.config.freq,
             interpolate=self.config.impute_missing
         )
 

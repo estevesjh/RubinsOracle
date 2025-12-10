@@ -20,6 +20,7 @@ class BaseForecasterConfig(BaseModel):
         name: Model name identifier
         lag_days: Number of historical days to use (NeuralProphet: n_lags, Prophet: training window)
         n_forecast: Number of steps to forecast ahead
+        freq: Data frequency for training and forecasting (e.g., 'h', '15min', 'D')
         yearly_seasonality: Enable yearly seasonality (bool or Fourier order)
         weekly_seasonality: Enable weekly seasonality (bool or Fourier order)
         daily_seasonality: Enable daily seasonality (bool or Fourier order)
@@ -34,6 +35,9 @@ class BaseForecasterConfig(BaseModel):
     name: str
     lag_days: int = Field(default=48, ge=1)
     n_forecast: int = Field(default=48, ge=1)
+
+    # Data frequency
+    freq: str = Field(default='h', description="Pandas frequency string (e.g., 'h', '15min', 'D')")
 
     # Seasonality
     yearly_seasonality: bool | int = False

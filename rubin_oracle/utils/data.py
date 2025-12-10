@@ -76,27 +76,75 @@ def validate_input(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def compute_temp_mean(
+    df: pd.DataFrame,
+    temp_max_col: str = 'tempMax',
+    temp_min_col: str = 'tempMin',
+) -> pd.DataFrame:
+    """Compute temperature mean from tempMax and tempMin.
+
+    This is the proper way to calculate mean temperature from daily
+    max/min values, rather than simple interpolation.
+
+    Args:
+        df: DataFrame with temperature columns
+        temp_max_col: Name of maximum temperature column
+        temp_min_col: Name of minimum temperature column
+
+    Returns:
+        DataFrame with added 'y' column containing mean temperature
+
+    Example:
+        >>> df = pd.DataFrame({
+        ...     'ds': dates,
+        ...     'tempMax': [25, 26, 27],
+        ...     'tempMin': [15, 16, 14]
+        ... })
+        >>> df = compute_temp_mean(df)
+        >>> df['y']  # (tempMax + tempMin) / 2
+        [20.0, 21.0, 20.5]
+    """
+    if temp_max_col not in df.columns or temp_min_col not in df.columns:
+        raise ValueError(
+            f"Columns '{temp_max_col}' and '{temp_min_col}' are required "
+            "for temperature mean calculation"
+        )
+
+    df = df.copy()
+    df['y'] = (df[temp_max_col] + df[temp_min_col]) / 2.0
+
+    return df
+
+
 def prepare_regular_frequency(
     df: pd.DataFrame,
     freq: str = 'h',
     interpolate: bool = True,
+    method: str = 'time',
 ) -> pd.DataFrame:
     """Prepare time series with regular frequency.
 
     Ensures data has consistent temporal spacing by reindexing to a regular
     grid and optionally interpolating missing values.
 
+    IMPORTANT: For temperature data, use compute_temp_mean() first to calculate
+    the mean from tempMax/tempMin before calling this function. Simple interpolation
+    is not appropriate for temperature aggregation.
+
     Args:
         df: DataFrame with 'ds' and 'y' columns
         freq: Target frequency ('15min', 'h', 'D', etc.)
-        interpolate: Whether to interpolate missing values using time-based interpolation
+        interpolate: Whether to interpolate missing values
+        method: Interpolation method ('time', 'linear', 'nearest', 'ffill', 'bfill')
 
     Returns:
         DataFrame with regular frequency and no gaps
 
     Example:
-        >>> # Prepare hourly data from 15-minute observations
-        >>> df_hourly = prepare_regular_frequency(df, freq='h')
+        >>> # For temperature data, first compute mean from max/min
+        >>> df = compute_temp_mean(df, 'tempMax', 'tempMin')
+        >>> # Then prepare regular frequency
+        >>> df_hourly = prepare_regular_frequency(df, freq='h', interpolate=False)
     """
     # Validate input first
     df = validate_input(df)
@@ -121,7 +169,14 @@ def prepare_regular_frequency(
 
     # Interpolate if requested
     if interpolate:
-        df_regular['y'] = df_regular['y'].interpolate(method='time')
+        if method in ['time', 'linear']:
+            df_regular['y'] = df_regular['y'].interpolate(method=method)
+        elif method == 'ffill':
+            df_regular['y'] = df_regular['y'].ffill()
+        elif method == 'bfill':
+            df_regular['y'] = df_regular['y'].bfill()
+        elif method == 'nearest':
+            df_regular['y'] = df_regular['y'].interpolate(method='nearest')
 
     # Reset index to get 'ds' column back
     df_regular = df_regular.reset_index()

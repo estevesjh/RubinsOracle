@@ -124,8 +124,8 @@ class ProphetForecaster:
         if periods is None:
             periods = self.config.n_forecast
 
-        # Create future dataframe
-        future = self.model_.make_future_dataframe(periods=periods, freq='h')
+        # Create future dataframe with configured frequency
+        future = self.model_.make_future_dataframe(periods=periods, freq=self.config.freq)
 
         # Generate predictions
         forecast = self.model_.predict(future)

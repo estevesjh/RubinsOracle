@@ -2,6 +2,9 @@ name: prophet
 lag_days: 48
 n_forecast: 48
 
+# Data frequency (pandas frequency string: 'h', '15min', 'D', etc.)
+freq: h
+
 # Seasonality
 yearly_seasonality: false
 weekly_seasonality: false

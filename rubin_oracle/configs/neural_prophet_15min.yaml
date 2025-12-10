@@ -1,9 +1,9 @@
 name: neural_prophet
-lag_days: 48
-n_forecast: 48
+lag_days: 192  # 192 steps at 15min = 48 hours
+n_forecast: 96  # 96 steps at 15min = 24 hours
 
 # Data frequency (pandas frequency string: 'h', '15min', 'D', etc.)
-freq: h
+freq: 15min
 
 # Seasonality
 yearly_seasonality: false
@@ -36,5 +36,5 @@ quantiles:
   - 0.84
 
 # Data handling
-drop_missing: true
+drop_missing: false
 impute_missing: true
