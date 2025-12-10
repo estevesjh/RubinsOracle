@@ -21,6 +21,7 @@ class BaseForecasterConfig(BaseModel):
         lag_days: Number of historical days to use (NeuralProphet: n_lags, Prophet: training window)
         n_forecast: Number of steps to forecast ahead
         freq: Data frequency for training and forecasting (e.g., 'h', '15min', 'D')
+        freq_per_day: Observations per day (4=15min, 24=hourly) for decomposition
         yearly_seasonality: Enable yearly seasonality (bool or Fourier order)
         weekly_seasonality: Enable weekly seasonality (bool or Fourier order)
         daily_seasonality: Enable daily seasonality (bool or Fourier order)
@@ -28,6 +29,9 @@ class BaseForecasterConfig(BaseModel):
         growth: Trend growth type
         n_changepoints: Number of potential changepoints for trend
         changepoints_range: Proportion of history for changepoint detection
+        use_decomposition: Whether to apply signal decomposition preprocessing
+        train_start_date: Start date for training data (None = use all available)
+        train_end_date: End date for training data (None = use all available)
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -38,6 +42,7 @@ class BaseForecasterConfig(BaseModel):
 
     # Data frequency
     freq: str = Field(default='h', description="Pandas frequency string (e.g., 'h', '15min', 'D')")
+    freq_per_day: int = Field(default=4, ge=1, description="Observations per day (4=15min, 24=hourly)")
 
     # Seasonality
     yearly_seasonality: bool | int = False
@@ -46,9 +51,17 @@ class BaseForecasterConfig(BaseModel):
     seasonality_mode: Literal["additive", "multiplicative"] = "additive"
 
     # Trend
-    growth: Literal["linear", "logistic", "flat"] = "linear"
     n_changepoints: int = Field(default=12, ge=0)
     changepoints_range: float = Field(default=0.85, gt=0.0, le=1.0)
+
+    # Preprocessing
+    use_decomposition: bool = Field(default=False, description="Apply signal decomposition preprocessing")
+    savgol_mode: Literal['mirror', 'nearest', 'constant', 'wrap', 'interp'] = Field(
+        default='nearest',
+        description="Savitzky-Golay filter boundary mode ('nearest' recommended for temp data)"
+    )
+    train_start_date: str | None = Field(default=None, description="Start date for training (YYYY-MM-DD)")
+    train_end_date: str | None = Field(default=None, description="End date for training (YYYY-MM-DD)")
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> BaseForecasterConfig:
@@ -102,7 +115,6 @@ class ProphetConfig(BaseForecasterConfig):
     name: Literal["prophet"] = "prophet"
     changepoint_prior_scale: float = Field(default=0.05, gt=0.0)
     seasonality_prior_scale: float = Field(default=10.0, gt=0.0)
-    holidays_prior_scale: float = Field(default=0.0, gt=0.0)
     interval_width: float = Field(default=0.68, gt=0.0, lt=1.0)
 
 

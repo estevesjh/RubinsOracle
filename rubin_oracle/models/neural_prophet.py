@@ -7,14 +7,33 @@ for neural network-based time series forecasting.
 from __future__ import annotations
 
 from pathlib import Path
+import warnings
+import torch
+
+# Suppress NeuralProphet and PyTorch warnings
+# Monkeypatch torch.load to avoid weights_only warning
+_original_load = torch.load
+def safe_load(*a, **k):
+    if "weights_only" not in k:
+        k["weights_only"] = False
+    return _original_load(*a, **k)
+torch.load = safe_load
+
+# Filter specific warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module=r"neuralprophet")
+warnings.filterwarnings("ignore", category=UserWarning, module=r"pytorch_lightning")
+warnings.filterwarnings("ignore", message="weights_only=False")
+warnings.filterwarnings("ignore", message="concatenation with empty or all-NA")
+warnings.filterwarnings("ignore", message="DataFrame is highly fragmented")
 
 import pandas as pd
 
 from rubin_oracle.config import NeuralProphetConfig
+from rubin_oracle.preprocessing import preprocess_for_forecast
 from rubin_oracle.utils import prepare_regular_frequency, validate_input
 
 try:
-    from neuralprophet import NeuralProphet
+    from neuralprophet import NeuralProphet, save, load
 except ImportError:
     raise ImportError(
         "NeuralProphet is required but not installed. "
@@ -73,6 +92,17 @@ class NeuralProphetForecaster:
         # Validate input
         df = validate_input(df)
 
+        # Apply preprocessing (decomposition and date filtering)
+        df = preprocess_for_forecast(
+            df,
+            decompose=self.config.use_decomposition,
+            freq=self.config.freq_per_day,
+            savgol_mode=self.config.savgol_mode,
+            train_start_date=self.config.train_start_date,
+            train_end_date=self.config.train_end_date,
+            lag_days=self.config.lag_days,
+        )
+
         # Prepare data with regular frequency from config
         df = prepare_regular_frequency(
             df,
@@ -89,7 +119,7 @@ class NeuralProphetForecaster:
 
         # Initialize NeuralProphet with config parameters
         self.model_ = NeuralProphet(
-            growth=self.config.growth,
+            growth='linear',  # Hardcoded default
             n_changepoints=self.config.n_changepoints,
             changepoints_range=self.config.changepoints_range,
             trend_reg=self.config.trend_reg,
@@ -107,6 +137,15 @@ class NeuralProphetForecaster:
             optimizer=self.config.optimizer,
             quantiles=self.config.quantiles,
         )
+
+        # Add decomposed components as regressors if decomposition was applied
+        if self.config.use_decomposition:
+            decomposed_components = [
+                'y_high', 'y_p0', 'y_p1', 'y_p2', 'y_p3', 'y_p4', 'y_p5', 'y_56day_trend'
+            ]
+            for component in decomposed_components:
+                if component in df.columns:
+                    self.model_.add_future_regressor(component)
 
         # Add AR layers if specified
         if self.config.ar_layers:
@@ -156,6 +195,19 @@ class NeuralProphetForecaster:
 
         # Validate and prepare input with configured frequency
         df = validate_input(df)
+
+        # Apply preprocessing if decomposition was used during training
+        if self.config.use_decomposition:
+            df = preprocess_for_forecast(
+                df,
+                decompose=True,
+                freq=self.config.freq_per_day,
+                savgol_mode=self.config.savgol_mode,
+                train_start_date=None,  # Don't filter for prediction
+                train_end_date=None,
+                lag_days=self.config.lag_days,
+            )
+
         df = prepare_regular_frequency(
             df,
             freq=self.config.freq,
@@ -183,99 +235,105 @@ class NeuralProphetForecaster:
 
         return forecast
 
-    def standardize_output(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Convert NeuralProphet wide format to standardized long format.
+    def standardize_output(
+        self,
+        df: pd.DataFrame,
+        issue_time: pd.Timestamp | None = None
+    ) -> pd.DataFrame:
+        """Convert NeuralProphet forecast output to standardized long format.
 
-        Transforms from NeuralProphet's wide format (yhat1, yhat2, ...)
-        to the standard format with one row per forecast step.
+        Transforms from NeuralProphet's forecast output to standard format
+        with one row per forecast step. Based on parse_raw_forecast logic.
 
         Args:
-            df: NeuralProphet forecast output in wide format
+            df: NeuralProphet forecast output (raw=False)
+            issue_time: Time when forecast was issued. If None, uses first 'ds' value.
 
         Returns:
             DataFrame with standardized columns:
                 - ds (datetime): Target timestamp (what the forecast is FOR)
                 - yhat (float): Point forecast
-                - yhat_lower (float): Lower uncertainty bound
-                - yhat_upper (float): Upper uncertainty bound
+                - yhat_lower (float): Lower uncertainty bound (16th percentile)
+                - yhat_upper (float): Upper uncertainty bound (84th percentile)
                 - step (int): Forecast horizon (1, 2, 3, ...)
+                - lead_time (float): Lead time in hours
 
         Example:
             >>> predictions = forecaster.predict(recent_df)
             >>> standardized = forecaster.standardize_output(predictions)
             >>> # Now in long format with explicit steps
         """
-        # Get the number of forecast steps from config
-        n_steps = self.config.n_forecast
+        # Determine issue time
+        if issue_time is None:
+            if 'ds' not in df.columns:
+                raise ValueError("DataFrame must have 'ds' column")
+            issue_time = pd.to_datetime(df['ds'].iloc[0])
 
-        # Extract base timestamp (forecast origin)
-        base_ds = df['ds'].iloc[0]
+        # Ensure issue_time has timezone
+        if issue_time.tzinfo is None:
+            issue_time = issue_time.tz_localize("UTC")
 
-        # Prepare lists to collect standardized data
-        standardized_data = []
+        # Ensure ds column is datetime with timezone
+        if 'ds' in df.columns:
+            df = df.copy()
+            df['ds'] = pd.to_datetime(df['ds'])
+            if df['ds'].dt.tz is None:
+                df['ds'] = df['ds'].dt.tz_localize("UTC")
+            else:
+                df['ds'] = df['ds'].dt.tz_convert("UTC")
 
-        for step in range(1, n_steps + 1):
-            # Calculate target timestamp
-            target_ds = base_ds + pd.Timedelta(hours=step)
+        # Determine frequency from config
+        freq_td = pd.to_timedelta(self.config.freq)
 
-            # Get point forecast
-            yhat_col = f'yhat{step}'
-            if yhat_col not in df.columns:
+        # Find yhat columns (yhat1, yhat2, ...)
+        yhat_cols = [c for c in df.columns if c.startswith("yhat") and c[4:].isdigit()]
+
+        if not yhat_cols:
+            # Fallback for single forecast or other formats
+            if "yhat" in df.columns:
+                yhat_cols = ["yhat1"]
+                df = df.rename(columns={"yhat": "yhat1"})
+            else:
+                return pd.DataFrame()
+
+        indices = sorted([int(c.replace("yhat", "")) for c in yhat_cols])
+
+        long_rows = []
+
+        for i in indices:
+            step_col = f"yhat{i}"
+            # For raw=False, yhat{i} at time t is the prediction for t made i steps ago.
+            # We want the prediction made AT issue_time for time t = issue_time + i*freq.
+            # So we look at the row where ds = issue_time + i*freq, and take column yhat{i}.
+
+            target_time = issue_time + i * freq_td
+            row = df[df['ds'] == target_time]
+
+            if row.empty:
                 continue
-            yhat = df[yhat_col].iloc[0]
 
-            # Get uncertainty bounds from quantiles
-            # Default quantiles are [0.16, 0.84] (roughly ±1 sigma)
-            lower_quantile = self.config.quantiles[0]
-            upper_quantile = self.config.quantiles[-1]
+            yhat = row[step_col].values[0]
 
-            lower_col = f'yhat{step} {lower_quantile:.0%}'
-            upper_col = f'yhat{step} {upper_quantile:.0%}'
+            # Handle quantiles
+            # NeuralProphet raw=False output includes columns like 'yhat1 16.0%', 'yhat1 84.0%'
+            lower_col = f"{step_col} 16.0%"
+            upper_col = f"{step_col} 84.0%"
 
-            # Handle different quantile column naming conventions
-            # NeuralProphet may use different formats
-            possible_lower_cols = [
-                lower_col,
-                f'yhat{step} {int(lower_quantile * 100)}',
-                f'yhat{step}_lower',
-            ]
-            possible_upper_cols = [
-                upper_col,
-                f'yhat{step} {int(upper_quantile * 100)}',
-                f'yhat{step}_upper',
-            ]
+            yhat_lower = row[lower_col].values[0] if lower_col in row.columns else yhat
+            yhat_upper = row[upper_col].values[0] if upper_col in row.columns else yhat
 
-            yhat_lower = None
-            yhat_upper = None
+            lead_time = i * freq_td.total_seconds() / 3600.0
 
-            for col in possible_lower_cols:
-                if col in df.columns:
-                    yhat_lower = df[col].iloc[0]
-                    break
-
-            for col in possible_upper_cols:
-                if col in df.columns:
-                    yhat_upper = df[col].iloc[0]
-                    break
-
-            # If quantiles not found, use point forecast as bounds (no uncertainty)
-            if yhat_lower is None:
-                yhat_lower = yhat
-            if yhat_upper is None:
-                yhat_upper = yhat
-
-            standardized_data.append({
-                'ds': target_ds,
-                'yhat': yhat,
-                'yhat_lower': yhat_lower,
-                'yhat_upper': yhat_upper,
-                'step': step,
+            long_rows.append({
+                "ds": target_time,
+                "yhat": yhat,
+                "yhat_lower": yhat_lower,
+                "yhat_upper": yhat_upper,
+                "step": i,
+                "lead_time": lead_time,
             })
 
-        # Create standardized DataFrame
-        standardized_df = pd.DataFrame(standardized_data)
-
-        return standardized_df
+        return pd.DataFrame(long_rows)
 
     def save(self, path: str | Path) -> None:
         """Save the fitted NeuralProphet model to disk.
@@ -294,9 +352,9 @@ class NeuralProphetForecaster:
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
 
-        # Save NeuralProphet model (uses PyTorch's save format)
-        model_path = str(path / 'model')
-        self.model_.save(model_path)
+        # Save NeuralProphet model using their function
+        model_path = str(path / 'model.np')
+        save(self.model_, model_path)
 
         # Save config
         config_path = path / 'config.yaml'
@@ -326,8 +384,8 @@ class NeuralProphetForecaster:
         # Create instance
         forecaster = cls(config)
 
-        # Load NeuralProphet model
-        model_path = str(path / 'model')
-        forecaster.model_ = NeuralProphet.load(model_path)
+        # Load NeuralProphet model using their function
+        model_path = str(path / 'model.np')
+        forecaster.model_ = load(model_path)
 
         return forecaster

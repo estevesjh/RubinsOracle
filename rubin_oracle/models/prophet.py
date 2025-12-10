@@ -14,6 +14,7 @@ from prophet import Prophet
 from prophet.serialize import model_from_json, model_to_json
 
 from rubin_oracle.config import ProphetConfig
+from rubin_oracle.preprocessing import preprocess_for_forecast
 from rubin_oracle.utils import validate_input
 
 
@@ -68,12 +69,22 @@ class ProphetForecaster:
         # Validate input
         df = validate_input(df)
 
+        # Apply preprocessing (decomposition and date filtering)
+        df = preprocess_for_forecast(
+            df,
+            decompose=self.config.use_decomposition,
+            freq=self.config.freq_per_day,
+            savgol_mode=self.config.savgol_mode,
+            train_start_date=self.config.train_start_date,
+            train_end_date=self.config.train_end_date,
+            lag_days=self.config.lag_days,
+        )
+
         # Store training data for predict() when df is not provided
         self._fit_df = df.copy()
 
         # Initialize Prophet with config parameters
         self.model_ = Prophet(
-            growth=self.config.growth,
             changepoints=None,
             n_changepoints=self.config.n_changepoints,
             changepoint_range=self.config.changepoints_range,
@@ -83,9 +94,17 @@ class ProphetForecaster:
             seasonality_mode=self.config.seasonality_mode,
             changepoint_prior_scale=self.config.changepoint_prior_scale,
             seasonality_prior_scale=self.config.seasonality_prior_scale,
-            holidays_prior_scale=self.config.holidays_prior_scale,
             interval_width=self.config.interval_width,
         )
+
+        # Add decomposed components as regressors if decomposition was applied
+        if self.config.use_decomposition:
+            decomposed_components = [
+                'y_high', 'y_p0', 'y_p1', 'y_p2', 'y_p3', 'y_p4', 'y_p5', 'y_56day_trend'
+            ]
+            for component in decomposed_components:
+                if component in df.columns:
+                    self.model_.add_regressor(component)
 
         # Fit the model
         self.model_.fit(df)

@@ -35,14 +35,19 @@ def validate_input(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         raise ValueError("Input DataFrame is empty")
 
-    # Check required columns
-    required_cols = {'ds', 'y'}
-    missing_cols = required_cols - set(df.columns)
-    if missing_cols:
-        raise ValueError(f"Missing required columns: {missing_cols}")
-
     # Make a copy to avoid modifying the original
     df = df.copy()
+
+    # Check required columns - allow tempMean as fallback for y
+    if 'ds' not in df.columns:
+        raise ValueError("Missing required column: 'ds'")
+
+    if 'y' not in df.columns and 'tempMean' not in df.columns:
+        raise ValueError("Missing required column: 'y' or 'tempMean'")
+
+    # Map tempMean to y if needed
+    if 'y' not in df.columns and 'tempMean' in df.columns:
+        df['y'] = df['tempMean']
 
     # Ensure 'ds' is datetime
     if not pd.api.types.is_datetime64_any_dtype(df['ds']):
