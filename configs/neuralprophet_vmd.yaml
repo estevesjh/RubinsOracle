@@ -1,0 +1,57 @@
+name: neural_prophet
+lag_days: 192
+n_forecast: 96
+model_dir: outputs/models/vmd
+
+# Data frequency
+freq: 15min
+freq_per_day: 96
+
+# Seasonality
+yearly_seasonality: false
+weekly_seasonality: false
+daily_seasonality: true
+seasonality_mode: additive
+
+# Trend
+n_changepoints: 12
+changepoints_range: 0.85
+
+# VMD decomposition (requires vmdpy)
+decomposer:
+  method: vmd
+  freq: 96  # 15-min data (96 samples/day)
+  verbose: false
+
+  # VMD parameters
+  alpha: 2000        # Bandwidth constraint (higher = narrower bands)
+  K_stage1: 5        # Modes for stage 1 (high-freq extraction)
+  K_stage2: 3        # Modes for stage 2 (remaining components)
+
+# AR configuration
+ar_layers: []
+ar_reg: 1.0
+
+# Trend regularization
+trend_reg: 1.0
+
+# Training
+epochs: 500
+batch_size: 128
+learning_rate: 0.001
+loss_func: SmoothL1Loss
+optimizer: AdamW
+
+# Early stopping
+early_stopping: true
+valid_pct: 0.1
+patience: 10
+
+# Uncertainty
+quantiles:
+  - 0.16
+  - 0.84
+
+# Data handling
+drop_missing: true
+impute_missing: true

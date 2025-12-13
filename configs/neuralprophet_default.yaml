@@ -1,0 +1,50 @@
+name: neural_prophet
+lag_days: 192
+n_forecast: 96
+model_dir: outputs/models/default
+
+# Data frequency
+freq: 15min
+freq_per_day: 96
+
+# Seasonality
+yearly_seasonality: false
+weekly_seasonality: true
+daily_seasonality: true
+seasonality_mode: additive
+
+# Trend
+n_changepoints: 12
+changepoints_range: 0.85
+
+# No decomposition
+decomposer:
+  method: none
+
+# AR configuration
+ar_layers: []
+ar_reg: 1.0
+
+# Trend regularization
+trend_reg: 1.0
+
+# Training
+epochs: 500
+batch_size: 128
+learning_rate: 0.003
+loss_func: SmoothL1Loss
+optimizer: AdamW
+
+# Early stopping
+early_stopping: true
+valid_pct: 0.1
+patience: 10
+
+# Uncertainty
+quantiles:
+  - 0.16
+  - 0.84
+
+# Data handling
+drop_missing: true
+impute_missing: true

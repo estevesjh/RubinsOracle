@@ -1,291 +1,1041 @@
-"""Signal preprocessing and decomposition for Rubin's Oracle.
+"""
+Signal Decomposition Module
 
-This module implements signal decomposition using Savitzky-Golay filters to extract
-multi-frequency components from temperature time series data. These decomposed
-components can be used as regressors in forecasting models.
+Provides flexible time series decomposition using Savitzky-Golay or Butterworth filters
+to extract multi-frequency components from signals.
+
+Classes:
+    BandpassDecomposer: Bandpass decomposer using period_pairs (direct bandpass filtering)
+        with edge effect mitigation and periodic NaN filling for forecasting applications
+    RubinVMDDecomposer: Two-stage VMD + Butterworth decomposition specifically designed
+        for Rubin Observatory temperature data (requires vmdpy)
+
+Functions:
+    fill_nan_periodic: Fill NaN values using same hour-of-day from adjacent periods
+    preprocess_for_forecast: Convenience function to preprocess data with decomposition
 """
 
-from __future__ import annotations
-
 import warnings
-from typing import Literal
-
+from typing import Optional, Literal, List, Tuple
 import numpy as np
 import pandas as pd
-from scipy.signal import savgol_filter
+from scipy.signal import savgol_filter, butter, filtfilt, sosfiltfilt
 
 
-class SignalDecomposer:
-    """Decomposes time series into multiple frequency components.
+# =============================================================================
+# Periodic NaN Fill Functions
+# =============================================================================
 
-    Uses Savitzky-Golay filters to extract trend components at different time scales,
-    from high-frequency (sub-daily) to low-frequency (multi-week) variations.
+def fill_nan_periodic(
+    y: np.ndarray | pd.Series,
+    freq: int = 96,
+    period_days: float = 1.0,
+    max_gap_periods: int = 7,
+    verbose: bool = True,
+) -> np.ndarray:
+    """Fill NaN values using same hour-of-day from adjacent periods.
 
-    Attributes:
-        freq: Data frequency in observations per day (e.g., 4 for 15min data, 24 for hourly)
-        polyorder: Polynomial order for Savitzky-Golay filter
-        mode: How to handle NaN values ('drop' or 'keep')
+    For daily cycles, this fills missing values with the weighted average of the
+    same time-of-day from the day before and day after. This preserves
+    the periodic structure better than linear interpolation.
+
+    Args:
+        y: Signal with NaN values
+        freq: Observations per day (default: 96 for 15-min data)
+        period_days: Period to use for filling (default: 1.0 for daily)
+        max_gap_periods: Maximum gap size to fill (in periods)
+            Gaps longer than this will remain NaN
+        verbose: Whether to print fill statistics
+
+    Returns:
+        Array with NaN filled using periodic values
 
     Example:
-        >>> decomposer = SignalDecomposer(freq=4)  # 15-minute data
-        >>> df_with_components = decomposer.decompose(df)
-        >>> # Now df has y_high, y_p0, y_p1, ..., y_p5 columns
+        >>> y_filled = fill_nan_periodic(df['y'], freq=96, period_days=1.0)
+    """
+    if isinstance(y, pd.Series):
+        y = y.values.copy()
+    else:
+        y = y.copy()
+
+    period = int(period_days * freq)
+    max_gap = max_gap_periods * period
+
+    # Find NaN indices
+    nan_mask = np.isnan(y)
+    nan_indices = np.where(nan_mask)[0]
+
+    if len(nan_indices) == 0:
+        return y
+
+    # Group consecutive NaN into gaps
+    gaps = []
+    if len(nan_indices) > 0:
+        gap_start = nan_indices[0]
+        gap_end = nan_indices[0]
+
+        for i in range(1, len(nan_indices)):
+            if nan_indices[i] == gap_end + 1:
+                gap_end = nan_indices[i]
+            else:
+                gaps.append((gap_start, gap_end))
+                gap_start = nan_indices[i]
+                gap_end = nan_indices[i]
+        gaps.append((gap_start, gap_end))
+
+    filled_count = 0
+
+    for gap_start, gap_end in gaps:
+        gap_length = gap_end - gap_start + 1
+
+        # Skip gaps that are too long
+        if gap_length > max_gap:
+            warnings.warn(
+                f"Gap at index {gap_start}-{gap_end} ({gap_length} points) "
+                f"exceeds max_gap_periods={max_gap_periods}. Skipping."
+            )
+            continue
+
+        # Fill each point in the gap
+        for i in range(gap_start, gap_end + 1):
+            candidates = []
+
+            # Look back multiple periods
+            for k in range(1, max_gap_periods + 1):
+                idx_back = i - k * period
+                if idx_back >= 0 and not np.isnan(y[idx_back]):
+                    candidates.append((y[idx_back], 1.0 / k))
+                    break
+
+            # Look forward multiple periods
+            for k in range(1, max_gap_periods + 1):
+                idx_forward = i + k * period
+                if idx_forward < len(y) and not np.isnan(y[idx_forward]):
+                    candidates.append((y[idx_forward], 1.0 / k))
+                    break
+
+            if candidates:
+                values = [c[0] for c in candidates]
+                weights = [c[1] for c in candidates]
+                y[i] = np.average(values, weights=weights)
+                filled_count += 1
+
+    # Final pass: linear interpolation for any remaining NaN
+    remaining_nan = np.isnan(y)
+    if remaining_nan.any():
+        y_series = pd.Series(y)
+        y = y_series.interpolate(method='linear').ffill().bfill().values
+
+    if verbose:
+        print(f"Filled {filled_count} NaN values using periodic fill (period={period_days}d)")
+
+    return y
+
+
+# =============================================================================
+# Bandpass Decomposer
+# =============================================================================
+
+class BandpassDecomposer:
+    """Decomposes time series into bandpass-filtered frequency components.
+
+    Uses pairs of periods to create bandpass filters that isolate specific
+    frequency bands. Supports Savitzky-Golay and Butterworth filtering with
+    edge effect mitigation for forecasting applications.
+
+    Key features:
+        - Period pairs for direct bandpass filtering (not lowpass cascade)
+        - Periodic NaN fill (preserves daily cycle structure)
+        - Edge effect mitigation (reflect padding, extrapolate, etc.)
+        - Edge weighting for forecasting (trust recent data more)
+        - Optional Butterworth cleanup after Savitzky-Golay
+        - Signal reconstruction from components
+
+    Attributes:
+        freq: Data frequency in observations per day
+        period_pairs: List of (low, high) period pairs in days
+        filter_type: Type of filter ('savgol' or 'butterworth')
+        edge_method: Padding method for edge effect mitigation
+
+    Example:
+        >>> decomposer = BandpassDecomposer(
+        ...     freq=96,
+        ...     period_pairs=[(0.5, 1), (1, 7), (7, 28)],
+        ...     filter_type='butterworth',
+        ...     edge_method='reflect',
+        ...     edge_pad_periods=2.0
+        ... )
+        >>> df_decomposed = decomposer.decompose(df)
+        >>> reconstructed = decomposer.reconstruct(df_decomposed)
     """
 
     def __init__(
         self,
-        freq: int = 4,
-        polyorder: int = 3,
-        mode: Literal['drop', 'keep'] = 'drop',
-        savgol_mode: Literal['mirror', 'nearest', 'constant', 'wrap', 'interp'] = 'nearest'
+        freq: int = 96,
+        period_pairs: Optional[List[Tuple[float, float]]] = None,
+        filter_type: Literal['savgol', 'butterworth'] = 'butterworth',
+        mode: Literal['drop', 'keep'] = 'keep',
+        # NaN handling
+        nan_fill: Literal['periodic', 'linear', 'ffill'] = 'periodic',
+        nan_fill_period: float = 1.0,
+        nan_fill_max_gap: int = 7,
+        # Edge effect mitigation
+        edge_method: Literal['none', 'reflect', 'symmetric', 'constant', 'extrapolate'] = 'reflect',
+        edge_pad_periods: float = 2.0,
+        # Edge weighting (for forecasting - trust recent data more)
+        use_edge_weighting: bool = False,
+        edge_weight_decay: float = 0.1,
+        # Savitzky-Golay specific parameters
+        savgol_polyorder: int = 3,
+        savgol_butter_cleanup: bool = True,
+        savgol_butter_margin: float = 0.1,
+        # Butterworth specific parameters
+        butter_order: int = 4,
+        # Output control
+        verbose: bool = True,
+        include_residual: bool = False,
     ):
-        """Initialize the signal decomposer.
+        """Initialize the bandpass signal decomposer.
 
         Args:
-            freq: Number of observations per day (4 = 15min, 24 = hourly)
-            polyorder: Polynomial order for Savitzky-Golay filter (must be < window_length)
-            mode: How to handle NaN values created by filtering:
-                - 'drop': Remove rows with NaN in decomposed components
-                - 'keep': Keep all rows (NaN will be at start/end of each component)
-            savgol_mode: Boundary mode for Savitzky-Golay filter:
-                - 'nearest': Extend with edge values (recommended for temp data)
-                - 'mirror': Mirror values at edges
-                - 'constant': Use constant value at edges
-                - 'wrap': Wrap around to other end
-                - 'interp': Polynomial interpolation
+            freq: Number of observations per day
+                - 15-min data: 96
+                - 30-min data: 48
+                - Hourly data: 24
+            period_pairs: List of (period_low, period_high) tuples in days.
+                Each pair defines a frequency band to extract.
+                Example: [(0.5, 1), (1, 7), (7, 28)]
+            filter_type: Type of filter
+                - 'savgol': Savitzky-Golay (difference of two lowpass filters)
+                - 'butterworth': Butterworth IIR bandpass filter
+            mode: How to handle NaN values in output
+                - 'drop': Remove rows with NaN
+                - 'keep': Keep all rows
+            nan_fill: Method to fill NaN before filtering
+                - 'periodic': Use same hour from adjacent days (best for daily cycles)
+                - 'linear': Linear interpolation
+                - 'ffill': Forward fill then backward fill
+            nan_fill_period: Period in days for periodic fill (default: 1.0 for daily)
+            nan_fill_max_gap: Maximum gap size in periods for periodic fill
+            edge_method: Method to mitigate edge effects
+                - 'none': No padding (worst edge effects)
+                - 'reflect': Reflect signal at edges (recommended)
+                - 'symmetric': Symmetric reflection including endpoint
+                - 'constant': Pad with edge values
+                - 'extrapolate': Linear extrapolation at edges
+            edge_pad_periods: How many periods to pad at each edge (default: 2.0)
+            use_edge_weighting: If True, apply exponential weighting to trust recent data more
+            edge_weight_decay: Decay rate for edge weighting
+            savgol_polyorder: Polynomial order for Savitzky-Golay filter
+            savgol_butter_cleanup: If True, apply Butterworth bandpass after Savitzky-Golay
+            savgol_butter_margin: Frequency margin for Butterworth cleanup
+            butter_order: Order of Butterworth filter
+            verbose: Whether to print progress messages
+            include_residual: Whether to include residual (original - reconstructed) as feature
         """
         self.freq = freq
-        self.polyorder = polyorder
+        self.filter_type = filter_type
         self.mode = mode
-        self.savgol_mode = savgol_mode
+        self.verbose = verbose
+        self.include_residual = include_residual
 
-        # Define window lengths for different frequency components
-        # Based on multiples of observations per day
-        self._windows = self._calculate_windows()
+        # NaN handling parameters
+        self.nan_fill = nan_fill
+        self.nan_fill_period = nan_fill_period
+        self.nan_fill_max_gap = nan_fill_max_gap
 
-    def _calculate_windows(self) -> dict[str, int]:
-        """Calculate window lengths for each frequency component.
+        # Edge effect parameters
+        self.edge_method = edge_method
+        self.edge_pad_periods = edge_pad_periods
+        self.use_edge_weighting = use_edge_weighting
+        self.edge_weight_decay = edge_weight_decay
 
-        Returns:
-            Dictionary mapping component names to window lengths
-        """
-        windows = {
-            'p0': 1 * self.freq + 1,           # Sub-daily
-            'day': int(1.4 * 24 * self.freq) + 1,  # Daily
-            '3day': int(2.4 * 24 * self.freq) + 1,  # 3-day
-            '6day': 6 * 24 * self.freq + 1,         # 6-day
-            '11day': 11 * 24 * self.freq + 1,       # 11-day
-            '14day': 17 * 24 * self.freq + 1,       # 14-day (using 17)
-            '28day': 28 * 24 * self.freq + 1,       # 28-day
-            '56day': 57 * 24 * self.freq + 1,       # 56-day (using 57)
-        }
+        # Set default period pairs if not provided
+        if period_pairs is None:
+            self.period_pairs = [
+                (0.25, 0.75),   # Sub-daily
+                (0.75, 1.25),   # Daily
+                (1.5, 7.0),     # Weekly
+                (7.0, 30.0),    # Monthly
+                (30.0, 180.0),  # Trend
+            ]
+        else:
+            self.period_pairs = period_pairs
 
-        # Ensure all windows are odd (required by savgol_filter)
-        for key, window in windows.items():
-            if window % 2 == 0:
-                windows[key] = window + 1
+        # Savitzky-Golay parameters
+        self.savgol_polyorder = savgol_polyorder
+        self.savgol_butter_cleanup = savgol_butter_cleanup
+        self.savgol_butter_margin = savgol_butter_margin
 
-        return windows
+        # Butterworth parameters
+        self.butter_order = butter_order
 
-    def _apply_savgol(
+        # Calculate filter specifications
+        self._filter_specs = self._calculate_filter_specs()
+
+    def _calculate_filter_specs(self) -> List[dict]:
+        """Calculate filter specifications for each frequency band."""
+        specs = []
+
+        for i, (period_low, period_high) in enumerate(self.period_pairs):
+            period_low_obs = period_low * self.freq
+            period_high_obs = period_high * self.freq
+
+            spec = {
+                'name': f'band_{i}',
+                'period_low_days': period_low,
+                'period_high_days': period_high,
+                'period_low_obs': period_low_obs,
+                'period_high_obs': period_high_obs,
+            }
+
+            if self.filter_type == 'savgol':
+                low_window = int(period_low_obs * 1.5)
+                high_window = int(period_high_obs * 1.5)
+
+                low_window = max(self.savgol_polyorder + 2, low_window)
+                high_window = max(self.savgol_polyorder + 2, high_window)
+
+                if low_window % 2 == 0:
+                    low_window += 1
+                if high_window % 2 == 0:
+                    high_window += 1
+
+                spec['low_window'] = low_window
+                spec['high_window'] = high_window
+
+            elif self.filter_type == 'butterworth':
+                nyquist = 0.5
+                f_low = 1 / period_high_obs
+                f_high = 1 / period_low_obs
+
+                spec['lowcut'] = max(0.001, min(0.999, f_low / nyquist))
+                spec['highcut'] = max(0.001, min(0.999, f_high / nyquist))
+
+                if spec['lowcut'] >= spec['highcut']:
+                    mid = (spec['lowcut'] + spec['highcut']) / 2
+                    spec['lowcut'] = mid * 0.8
+                    spec['highcut'] = mid * 1.2
+
+            spec['pad_length'] = int(self.edge_pad_periods * max(period_low_obs, period_high_obs))
+            specs.append(spec)
+
+        return specs
+
+    def _pad_signal(self, y: np.ndarray, pad_length: int) -> Tuple[np.ndarray, int]:
+        """Pad signal at edges to reduce edge effects."""
+        if self.edge_method == 'none' or pad_length <= 0:
+            return y, 0
+
+        n = len(y)
+        pad_length = min(pad_length, n - 1)
+
+        if pad_length < 1:
+            return y, 0
+
+        if self.edge_method == 'reflect':
+            left_pad = y[1:pad_length+1][::-1]
+            right_pad = y[-(pad_length+1):-1][::-1]
+
+        elif self.edge_method == 'symmetric':
+            left_pad = y[:pad_length][::-1]
+            right_pad = y[-pad_length:][::-1]
+
+        elif self.edge_method == 'constant':
+            left_pad = np.full(pad_length, y[0])
+            right_pad = np.full(pad_length, y[-1])
+
+        elif self.edge_method == 'extrapolate':
+            n_fit = min(pad_length, n // 4, 100)
+            n_fit = max(2, n_fit)
+
+            left_slope, left_intercept = np.polyfit(np.arange(n_fit), y[:n_fit], 1)
+            left_pad = left_intercept + left_slope * np.arange(-pad_length, 0)
+
+            right_x = np.arange(n - n_fit, n)
+            right_slope, right_intercept = np.polyfit(right_x, y[-n_fit:], 1)
+            right_pad = right_intercept + right_slope * np.arange(n, n + pad_length)
+
+        else:
+            return y, 0
+
+        padded = np.concatenate([left_pad, y, right_pad])
+        return padded, pad_length
+
+    def _unpad_signal(self, y_padded: np.ndarray, pad_length: int) -> np.ndarray:
+        """Remove padding from signal."""
+        if pad_length <= 0:
+            return y_padded
+        return y_padded[pad_length:-pad_length]
+
+    def _apply_edge_weighting(self, original: np.ndarray, filtered: np.ndarray) -> np.ndarray:
+        """Apply exponential weighting to blend filtered result with original at edges."""
+        if not self.use_edge_weighting:
+            return filtered
+
+        n = len(filtered)
+        result = filtered.copy()
+        edge_region = min(n // 10, 100)
+
+        if edge_region < 2:
+            return filtered
+
+        weights = np.ones(edge_region)
+        decay_indices = np.arange(edge_region)
+        weights = 1.0 - 0.5 * (1 - np.exp(-self.edge_weight_decay * (edge_region - decay_indices)))
+
+        fit_region = min(edge_region * 2, n // 2)
+        if fit_region >= 2:
+            x_fit = np.arange(n - fit_region, n)
+            slope, intercept = np.polyfit(x_fit, original[n - fit_region:], 1)
+            local_trend = intercept + slope * np.arange(n - edge_region, n)
+
+            result[-edge_region:] = (
+                weights * filtered[-edge_region:] +
+                (1 - weights) * local_trend
+            )
+
+        return result
+
+    def _apply_savgol_bandpass(
         self,
         y: np.ndarray,
-        window_length: int,
-        name: str
+        low_window: int,
+        high_window: int,
+        name: str,
+        pad_length: int,
+        is_trend: bool = False,
+        period_low_days: float = None,
+        period_high_days: float = None
     ) -> np.ndarray:
-        """Apply Savitzky-Golay filter with configurable boundary handling.
+        """Apply Savitzky-Golay bandpass filter with edge padding."""
+        y_padded, actual_pad = self._pad_signal(y, pad_length)
 
-        Args:
-            y: Input signal
-            window_length: Filter window length
-            name: Component name (for logging)
-
-        Returns:
-            Filtered signal (with NaN at boundaries if mode='interp')
-        """
-        if len(y) < window_length:
-            warnings.warn(
-                f"Data length ({len(y)}) is shorter than window length ({window_length}) "
-                f"for {name} component. Returning NaN array."
-            )
+        if len(y_padded) < max(low_window, high_window):
+            warnings.warn(f"{name}: Signal too short for window sizes. Returning NaN.")
             return np.full_like(y, np.nan)
 
-        try:
-            filtered = savgol_filter(
-                y,
-                window_length=window_length,
-                polyorder=self.polyorder,
-                mode=self.savgol_mode  # Use configurable mode
-            )
+        nyquist_length = len(y_padded) // 2
 
-            # Only set explicit NaN boundaries if mode is 'interp'
-            # Other modes handle boundaries appropriately
-            if self.savgol_mode == 'interp':
-                half_window = window_length // 2
-                filtered[:half_window] = np.nan
-                filtered[-half_window:] = np.nan
+        try:
+            if high_window > nyquist_length or is_trend:
+                if low_window > len(y_padded):
+                    low_window = len(y_padded) if len(y_padded) % 2 == 1 else len(y_padded) - 1
+
+                lowpass = savgol_filter(y_padded, low_window, self.savgol_polyorder, mode='nearest')
+                bandpass = self._unpad_signal(lowpass, actual_pad)
+
+                if self.savgol_butter_cleanup and period_low_days is not None:
+                    bandpass = self._apply_butter_lowpass(bandpass, period_low_days, name)
+
+            else:
+                lowpass_low = savgol_filter(y_padded, low_window, self.savgol_polyorder, mode='nearest')
+                lowpass_high = savgol_filter(y_padded, high_window, self.savgol_polyorder, mode='nearest')
+
+                bandpass_padded = lowpass_low - lowpass_high
+                bandpass = self._unpad_signal(bandpass_padded, actual_pad)
+
+                if self.savgol_butter_cleanup and period_low_days is not None:
+                    bandpass = self._apply_butter_bandpass_cleanup(
+                        bandpass, period_low_days, period_high_days, name
+                    )
+
+            bandpass = self._apply_edge_weighting(y, bandpass)
+            return bandpass
+
+        except Exception as e:
+            warnings.warn(f"Error in Savitzky-Golay for {name}: {e}")
+            return np.full_like(y, np.nan)
+
+    def _apply_butterworth_bandpass(
+        self,
+        y: np.ndarray,
+        lowcut: float,
+        highcut: float,
+        name: str,
+        pad_length: int,
+        is_trend: bool = False
+    ) -> np.ndarray:
+        """Apply Butterworth bandpass filter with edge padding."""
+        y_padded, actual_pad = self._pad_signal(y, pad_length)
+
+        try:
+            if is_trend or (highcut - lowcut) < 0.001:
+                sos = butter(self.butter_order, highcut, btype='low', output='sos')
+            else:
+                sos = butter(self.butter_order, [lowcut, highcut], btype='band', output='sos')
+
+            filtered_padded = sosfiltfilt(sos, y_padded, padtype='odd', padlen=min(100, len(y_padded)//4))
+            filtered = self._unpad_signal(filtered_padded, actual_pad)
+            filtered = self._apply_edge_weighting(y, filtered)
 
             return filtered
 
         except Exception as e:
-            warnings.warn(f"Error applying Savitzky-Golay filter for {name}: {e}")
+            warnings.warn(f"Error in Butterworth for {name}: {e}")
             return np.full_like(y, np.nan)
 
+    def _apply_butter_bandpass_cleanup(
+        self,
+        signal: np.ndarray,
+        period_low_days: float,
+        period_high_days: float,
+        name: str
+    ) -> np.ndarray:
+        """Apply Butterworth bandpass to clean up SavGol output."""
+        try:
+            period_low_obs = period_low_days * self.freq
+            period_high_obs = period_high_days * self.freq
+
+            nyquist = 0.5
+            f_low = 1 / period_high_obs
+            f_high = 1 / period_low_obs
+
+            margin = self.savgol_butter_margin
+            lowcut = max(0.001, min(0.999, f_low * (1 - margin) / nyquist))
+            highcut = max(0.001, min(0.999, f_high * (1 + margin) / nyquist))
+
+            if lowcut >= highcut:
+                return signal
+
+            sos = butter(self.butter_order, [lowcut, highcut], btype='band', output='sos')
+            return sosfiltfilt(sos, signal, padtype='odd', padlen=min(50, len(signal)//4))
+
+        except Exception as e:
+            warnings.warn(f"Butterworth cleanup failed for {name}: {e}")
+            return signal
+
+    def _apply_butter_lowpass(
+        self,
+        signal: np.ndarray,
+        period_low_days: float,
+        name: str
+    ) -> np.ndarray:
+        """Apply Butterworth lowpass for trend extraction."""
+        try:
+            period_low_obs = period_low_days * self.freq
+            nyquist = 0.5
+            f_high = 1 / period_low_obs
+
+            margin = self.savgol_butter_margin
+            highcut = max(0.001, min(0.999, f_high * (1 + margin) / nyquist))
+
+            sos = butter(self.butter_order, highcut, btype='low', output='sos')
+            return sosfiltfilt(sos, signal, padtype='odd', padlen=min(50, len(signal)//4))
+
+        except Exception as e:
+            warnings.warn(f"Butterworth lowpass failed for {name}: {e}")
+            return signal
+
     def decompose(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Decompose time series into multi-frequency components.
+        """Decompose time series into bandpass-filtered frequency components.
 
         Args:
             df: Input dataframe with columns:
                 - ds (datetime): Timestamps
-                - y (float): Target values (or tempMean as fallback)
+                - y (float): Target values
 
         Returns:
-            DataFrame with original columns plus decomposed components:
-                - y_p0_trend, y_day_trend, ..., y_56day_trend: Trend components
-                - y_high: High-frequency residual (y - y_p0_trend)
-                - y_p0: Sub-daily variation (y_p0_trend - y_day_trend)
-                - y_p1: 1-3 day variation (y_3day_trend - y_6day_trend)
-                - y_p2: 3-6 day variation (y_6day_trend - y_11day_trend)
-                - y_p3: 6-11 day variation (y_11day_trend - y_14day_trend)
-                - y_p4: 11-28 day variation (y_14day_trend - y_28day_trend)
-                - y_p5: 28-56 day variation (y_28day_trend - y_56day_trend)
-
-        Raises:
-            ValueError: If required columns are missing
+            DataFrame with original columns plus bandpass components:
+                - y_band_0, y_band_1, ...: Bandpass components for each period pair
         """
         df = df.copy()
 
-        # Ensure 'y' exists
+        if 'y' not in df.columns:
+            if 'tempMean' in df.columns:
+                df['y'] = df['tempMean']
+            else:
+                raise ValueError("Column 'y' or 'tempMean' not found.")
+
+        nan_count = df['y'].isna().sum()
+
+        # Fill NaN values based on method
+        if nan_count > 0:
+            if self.nan_fill == 'periodic':
+                y_filled = fill_nan_periodic(
+                    df['y'].values,
+                    freq=self.freq,
+                    period_days=self.nan_fill_period,
+                    max_gap_periods=self.nan_fill_max_gap,
+                    verbose=self.verbose,
+                )
+            elif self.nan_fill == 'linear':
+                y_filled = df['y'].interpolate(method='linear').ffill().bfill().values
+                if self.verbose:
+                    print(f"Filled {nan_count} NaN values using linear interpolation")
+            else:  # ffill
+                y_filled = df['y'].ffill().bfill().values
+                if self.verbose:
+                    print(f"Filled {nan_count} NaN values using forward/backward fill")
+        else:
+            y_filled = df['y'].values
+
+        if self.verbose:
+            print(f"\n{'='*70}")
+            print(f"Bandpass Decomposition - {self.filter_type.upper()}")
+            print(f"{'='*70}")
+            print(f"Data frequency: {self.freq} obs/day")
+            print(f"Data length: {len(y_filled)} observations ({len(y_filled)/self.freq:.1f} days)")
+            print(f"NaN handling: {self.nan_fill} (period={self.nan_fill_period}d)")
+            print(f"Edge method: {self.edge_method} (pad={self.edge_pad_periods} periods)")
+            print(f"Edge weighting: {self.use_edge_weighting}")
+            print(f"Number of bands: {len(self.period_pairs)}")
+            print(f"{'='*70}\n")
+
+        for idx, spec in enumerate(self._filter_specs):
+            name = spec['name']
+            period_low = spec['period_low_days']
+            period_high = spec['period_high_days']
+            pad_length = spec['pad_length']
+            is_trend = (idx == len(self._filter_specs) - 1)
+
+            if self.filter_type == 'savgol':
+                low_window = spec['low_window']
+                high_window = spec['high_window']
+                if self.verbose:
+                    print(f"Computing {name} ({period_low:.2f}-{period_high:.2f}d, "
+                          f"windows=[{low_window}, {high_window}], pad={pad_length})...")
+
+                df[f'y_{name}'] = self._apply_savgol_bandpass(
+                    y_filled, low_window, high_window, name, pad_length,
+                    is_trend=is_trend,
+                    period_low_days=period_low,
+                    period_high_days=period_high
+                )
+
+            elif self.filter_type == 'butterworth':
+                lowcut = spec['lowcut']
+                highcut = spec['highcut']
+                if self.verbose:
+                    print(f"Computing {name} ({period_low:.2f}-{period_high:.2f}d, "
+                          f"freqs=[{lowcut:.4f}, {highcut:.4f}], pad={pad_length})...")
+
+                df[f'y_{name}'] = self._apply_butterworth_bandpass(
+                    y_filled, lowcut, highcut, name, pad_length, is_trend=is_trend
+                )
+
+        if self.mode == 'drop':
+            component_cols = [f'y_{spec["name"]}' for spec in self._filter_specs]
+            initial_len = len(df)
+            df = df.dropna(subset=component_cols)
+            if self.verbose and len(df) < initial_len:
+                print(f"\nDropped {initial_len - len(df)} rows with NaN")
+
+        # Compute residual (original - reconstructed) if enabled
+        if self.include_residual:
+            reconstructed = self.reconstruct(df)
+            df['y_residual'] = y_filled - reconstructed
+
+            if self.verbose:
+                residual_std = np.std(df['y_residual'].values)
+                print(f"\nResidual std: {residual_std:.4f}")
+
+        if self.verbose:
+            print(f"\n{'='*70}")
+            print(f"Decomposition complete. Shape: {df.shape}")
+            print(f"{'='*70}\n")
+
+        return df
+
+    def get_component_names(self) -> List[str]:
+        """Get list of component column names."""
+        names = [f'y_{spec["name"]}' for spec in self._filter_specs]
+        if self.include_residual:
+            names.append('y_residual')
+        return names
+
+    def get_component_info(self) -> pd.DataFrame:
+        """Get information about the bandpass components."""
+        info = []
+        for spec in self._filter_specs:
+            component_info = {
+                'component': f'y_{spec["name"]}',
+                'period_low_days': spec['period_low_days'],
+                'period_high_days': spec['period_high_days'],
+                'pad_length': spec['pad_length'],
+            }
+
+            if self.filter_type == 'savgol':
+                component_info['low_window'] = spec['low_window']
+                component_info['high_window'] = spec['high_window']
+            elif self.filter_type == 'butterworth':
+                component_info['lowcut'] = spec['lowcut']
+                component_info['highcut'] = spec['highcut']
+
+            info.append(component_info)
+
+        return pd.DataFrame(info)
+
+    def reconstruct(self, df: pd.DataFrame) -> np.ndarray:
+        """Reconstruct signal from bandpass components (excludes residual).
+
+        Args:
+            df: DataFrame with decomposed components
+
+        Returns:
+            Reconstructed signal as numpy array
+        """
+        reconstructed = np.zeros(len(df))
+        for spec in self._filter_specs:
+            col = f"y_{spec['name']}"
+            if col in df.columns:
+                reconstructed += df[col].values
+        return reconstructed
+
+
+# =============================================================================
+# Rubin VMD Decomposer
+# =============================================================================
+
+# Check for vmdpy availability
+try:
+    from vmdpy import VMD
+    VMDPY_AVAILABLE = True
+except ImportError:
+    VMDPY_AVAILABLE = False
+
+
+class RubinVMDDecomposer:
+    """Two-stage VMD + Butterworth decomposition for Rubin temperature data.
+
+    This decomposer uses a hybrid approach specifically tuned for Rubin Observatory
+    temperature data characteristics:
+
+    Stage 1: VMD on original signal
+        - Extract IMF1 (lowest frequency mode)
+        - Apply Butterworth bandpass filters to separate IMF1 into:
+            - Daily: [0.5, 2.0] days
+            - Weekly: [1.5, 9.0] days
+            - Monthly: [21.0, 38.0] days
+            - Trend: [30.0, 200.0] days
+
+    Stage 2: VMD on residual (signal - monthly - trend)
+        - Extract high-frequency components:
+            - Sub-daily: IMF2 from residual VMD
+            - IMF3: Highest frequency (noise-like)
+
+    Final output (high freq to low freq):
+        - y_imf3: Highest frequency component (noise)
+        - y_subdaily: Sub-daily component (~12h)
+        - y_vmd_daily: Daily band (~24h)
+        - y_vmd_weekly: Weekly band (~7d)
+        - y_vmd_monthly: Monthly band (~28d)
+        - y_vmd_trend: Long-term trend
+
+    Requires: vmdpy (pip install vmdpy)
+
+    Example:
+        >>> decomposer = RubinVMDDecomposer(freq=96, alpha=2000)
+        >>> df_decomposed = decomposer.decompose(df)
+        >>> reconstructed = decomposer.reconstruct(df_decomposed)
+    """
+
+    def __init__(
+        self,
+        freq: int = 96,
+        alpha: float = 2000,
+        K_stage1: int = 5,
+        K_stage2: int = 3,
+        tau: float = 0,
+        DC: int = 0,
+        init: int = 1,
+        tol: float = 1e-7,
+        butter_order: int = 4,
+        butter_margin: float = 0.1,
+        verbose: bool = True,
+        include_residual: bool = False,
+    ):
+        """Initialize the Rubin VMD Decomposer.
+
+        Args:
+            freq: Number of observations per day (96 for 15-min, 48 for 30-min, 24 for hourly)
+            alpha: VMD bandwidth constraint (higher = narrower bands, default: 2000)
+            K_stage1: Number of modes for first VMD (default: 5, we only use IMF1)
+            K_stage2: Number of modes for second VMD (default: 3)
+            tau: Noise tolerance (0 = no noise)
+            DC: Whether to include DC component (0 = no, 1 = yes)
+            init: Initialization method (1 = uniform)
+            tol: Convergence tolerance
+            butter_order: Order of Butterworth filters
+            butter_margin: Frequency margin for Butterworth (default: 0.1 = 10%)
+            verbose: Whether to print progress messages
+            include_residual: Whether to include residual (original - reconstructed) as feature
+        """
+        if not VMDPY_AVAILABLE:
+            raise ImportError(
+                "vmdpy is required for RubinVMDDecomposer. "
+                "Install with: pip install vmdpy"
+            )
+
+        self.freq = freq
+        self.alpha = alpha
+        self.K_stage1 = K_stage1
+        self.K_stage2 = K_stage2
+        self.tau = tau
+        self.DC = DC
+        self.init = init
+        self.tol = tol
+        self.butter_order = butter_order
+        self.butter_margin = butter_margin
+        self.verbose = verbose
+        self.include_residual = include_residual
+
+        self.butter_periods = [
+            (0.5, 2.0),      # Daily band
+            (1.5, 9.0),      # Weekly band
+            (21.0, 38.0),    # Monthly band
+            (30.0, 200.0),   # Trend band
+        ]
+
+        self.band_names = ['vmd_daily', 'vmd_weekly', 'vmd_monthly', 'vmd_trend']
+
+    def _run_vmd(self, signal: np.ndarray, K: int) -> np.ndarray:
+        """Run VMD decomposition."""
+        original_length = len(signal)
+
+        u, u_hat, omega = VMD(
+            signal, self.alpha, self.tau, K, self.DC, self.init, self.tol
+        )
+
+        final_omega = omega[-1, :]
+        sorted_indices = np.argsort(final_omega)
+        u_sorted = u[sorted_indices]
+
+        if u_sorted.shape[1] != original_length:
+            new_u = np.zeros((K, original_length))
+            min_len = min(u_sorted.shape[1], original_length)
+            new_u[:, :min_len] = u_sorted[:, :min_len]
+
+            if u_sorted.shape[1] < original_length:
+                for i in range(K):
+                    new_u[i, min_len:] = u_sorted[i, -1]
+
+            u_sorted = new_u
+
+        return u_sorted
+
+    def _apply_butterworth_bandpass(
+        self,
+        signal: np.ndarray,
+        period_low: float,
+        period_high: float,
+        name: str,
+        is_trend: bool = False
+    ) -> np.ndarray:
+        """Apply Butterworth bandpass filter."""
+        try:
+            period_low_obs = period_low * self.freq
+            period_high_obs = period_high * self.freq
+
+            nyquist = 0.5
+            f_low = 1 / period_high_obs
+            f_high = 1 / period_low_obs
+
+            f_low_margin = f_low * (1 - self.butter_margin)
+            f_high_margin = f_high * (1 + self.butter_margin)
+
+            lowcut = max(0.001, min(0.999, f_low_margin / nyquist))
+            highcut = max(0.001, min(0.999, f_high_margin / nyquist))
+
+            if is_trend or lowcut >= highcut:
+                sos = butter(self.butter_order, highcut, btype='low', output='sos')
+            else:
+                sos = butter(self.butter_order, [lowcut, highcut], btype='band', output='sos')
+
+            filtered = sosfiltfilt(sos, signal)
+
+            if len(filtered) != len(signal):
+                if len(filtered) > len(signal):
+                    filtered = filtered[:len(signal)]
+                else:
+                    filtered = np.pad(filtered, (0, len(signal) - len(filtered)), mode='edge')
+
+            return filtered
+
+        except Exception as e:
+            warnings.warn(f"Error applying Butterworth for {name}: {e}")
+            return np.full(len(signal), np.nan)
+
+    def decompose(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Decompose time series using two-stage VMD + Butterworth."""
+        df = df.copy()
+
         if 'y' not in df.columns:
             if 'tempMean' in df.columns:
                 df['y'] = df['tempMean']
             else:
                 raise ValueError("Column 'y' or 'tempMean' not found in dataframe.")
 
-        # Fill NaN values for filtering (required for continuous signal)
-        # Use forward fill then backward fill to handle edges
-        y_filled = df['y'].fillna(method='ffill').fillna(method='bfill').values
+        y = df['y'].ffill().bfill().values
 
-        # Apply Savitzky-Golay filters for each trend component
-        print("Applying signal decomposition...")
+        if self.verbose:
+            print(f"\n{'='*70}")
+            print(f"Rubin VMD Decomposition")
+            print(f"{'='*70}")
+            print(f"Data frequency: {self.freq} obs/day")
+            print(f"Data length: {len(y)} observations ({len(y)/self.freq:.1f} days)")
+            print(f"VMD alpha: {self.alpha}")
+            print(f"{'='*70}\n")
 
-        print(f"Computing p0 trend (w={self._windows['p0']})...")
-        df['y_p0_trend'] = self._apply_savgol(y_filled, self._windows['p0'], 'p0')
+        # Stage 1
+        if self.verbose:
+            print(f"STAGE 1: VMD on original signal (K={self.K_stage1})...")
 
-        print(f"Computing day trend (w={self._windows['day']})...")
-        df['y_day_trend'] = self._apply_savgol(y_filled, self._windows['day'], 'day')
+        imfs_stage1 = self._run_vmd(y, self.K_stage1)
+        imf1 = imfs_stage1[0]
 
-        print(f"Computing 3day trend (w={self._windows['3day']})...")
-        df['y_3day_trend'] = self._apply_savgol(y_filled, self._windows['3day'], '3day')
+        if self.verbose:
+            print(f"  Extracted IMF1 (lowest frequency mode)")
+            print(f"  IMF1 std: {np.std(imf1):.4f}")
+            print(f"\nApplying Butterworth bandpass to IMF1...")
 
-        print(f"Computing 6day trend (w={self._windows['6day']})...")
-        df['y_6day_trend'] = self._apply_savgol(y_filled, self._windows['6day'], '6day')
+        for i, ((period_low, period_high), name) in enumerate(zip(self.butter_periods[1:], self.band_names[1:])):
+            is_trend = (i == len(self.butter_periods) - 2)
 
-        print(f"Computing 11day trend (w={self._windows['11day']})...")
-        df['y_11day_trend'] = self._apply_savgol(y_filled, self._windows['11day'], '11day')
+            if self.verbose:
+                print(f"  Computing {name} ({period_low:.2f}-{period_high:.1f}d)...")
 
-        print(f"Computing 14day trend (w={self._windows['14day']})...")
-        df['y_14day_trend'] = self._apply_savgol(y_filled, self._windows['14day'], '14day')
+            df[f'y_{name}'] = self._apply_butterworth_bandpass(
+                imf1, period_low, period_high, name, is_trend=is_trend
+            )
 
-        print(f"Computing 28day trend (w={self._windows['28day']})...")
-        df['y_28day_trend'] = self._apply_savgol(y_filled, self._windows['28day'], '28day')
+        # Stage 2
+        if self.verbose:
+            print(f"\nSTAGE 2: VMD on residual signal (K={self.K_stage2})...")
 
-        print(f"Computing 56day trend (w={self._windows['56day']})...")
-        df['y_56day_trend'] = self._apply_savgol(y_filled, self._windows['56day'], '56day')
+        residual = y - df['y_vmd_monthly'].values - df['y_vmd_trend'].values
 
-        # Calculate frequency components as differences between trends
-        print("Calculating frequency components...")
-        df['y_high'] = df['y'] - df['y_p0_trend']
-        df['y_p0'] = df['y_p0_trend'] - df['y_day_trend']
-        df['y_p1'] = df['y_3day_trend'] - df['y_6day_trend']
-        df['y_p2'] = df['y_6day_trend'] - df['y_11day_trend']
-        df['y_p3'] = df['y_11day_trend'] - df['y_14day_trend']
-        df['y_p4'] = df['y_14day_trend'] - df['y_28day_trend']
-        df['y_p5'] = df['y_28day_trend'] - df['y_56day_trend']
+        if self.verbose:
+            print(f"  Residual std: {np.std(residual):.4f}")
 
-        # Handle NaN values based on mode
-        if self.mode == 'drop':
-            # Drop rows where any decomposed component is NaN
-            component_cols = ['y_high', 'y_p0', 'y_p1', 'y_p2', 'y_p3', 'y_p4', 'y_p5']
-            initial_len = len(df)
-            df = df.dropna(subset=component_cols)
-            final_len = len(df)
+        imfs_stage2 = self._run_vmd(residual, self.K_stage2)
 
-            if final_len < initial_len:
-                print(f"Dropped {initial_len - final_len} rows with NaN in decomposed components")
+        daily = imfs_stage2[0]
+        subdaily = imfs_stage2[1]
+        imf3 = imfs_stage2[2]
 
-        print(f"Decomposition complete. Dataset shape: {df.shape}")
+        df['y_vmd_daily'] = self._apply_butterworth_bandpass(
+            daily, self.butter_periods[0][0], self.butter_periods[0][1], 'vmd_daily'
+        )
+        df['y_subdaily'] = subdaily
+        df['y_imf3'] = imf3
+
+        # Compute residual (original - reconstructed) if enabled
+        if self.include_residual:
+            reconstructed = self.reconstruct(df)
+            df['y_residual'] = y - reconstructed
+
+        if self.verbose:
+            print(f"  Extracted sub-daily (IMF2, std: {np.std(subdaily):.4f})")
+            print(f"  Extracted IMF3 / noise (std: {np.std(imf3):.4f})")
+            if self.include_residual:
+                print(f"  Residual std: {np.std(df['y_residual'].values):.4f}")
+
+            print(f"\n{'='*70}")
+            print(f"Decomposition complete!")
+            print(f"{'='*70}")
+            print(f"\nOutput components (high freq -> low freq):")
+            print(f"  1. y_imf3        : Highest freq / noise")
+            print(f"  2. y_subdaily    : Sub-daily component")
+            print(f"  3. y_vmd_daily   : {self.butter_periods[0]} days")
+            print(f"  4. y_vmd_weekly  : {self.butter_periods[1]} days")
+            print(f"  5. y_vmd_monthly : {self.butter_periods[2]} days")
+            print(f"  6. y_vmd_trend   : {self.butter_periods[3]} days")
+            if self.include_residual:
+                print(f"  7. y_residual    : Reconstruction residual")
+            print(f"\nDataset shape: {df.shape}")
+            print(f"{'='*70}\n")
 
         return df
 
+    def get_component_names(self) -> List[str]:
+        """Get list of component column names."""
+        names = ['y_imf3', 'y_subdaily', 'y_vmd_daily', 'y_vmd_weekly', 'y_vmd_monthly', 'y_vmd_trend']
+        if self.include_residual:
+            names.append('y_residual')
+        return names
+
+    def get_component_info(self) -> pd.DataFrame:
+        """Get information about the decomposed components."""
+        info = [
+            {'component': 'y_imf3', 'source': 'Residual VMD (Stage 2)', 'period': 'Very high freq'},
+            {'component': 'y_subdaily', 'source': 'Residual VMD (Stage 2)', 'period': 'Sub-daily (~12h)'},
+            {'component': 'y_vmd_daily', 'source': 'Butterworth on IMF1', 'period': f'{self.butter_periods[0]} days'},
+            {'component': 'y_vmd_weekly', 'source': 'Butterworth on IMF1', 'period': f'{self.butter_periods[1]} days'},
+            {'component': 'y_vmd_monthly', 'source': 'Butterworth on IMF1', 'period': f'{self.butter_periods[2]} days'},
+            {'component': 'y_vmd_trend', 'source': 'Butterworth on IMF1', 'period': f'{self.butter_periods[3]} days'},
+        ]
+        if self.include_residual:
+            info.append({'component': 'y_residual', 'source': 'Original - Reconstructed', 'period': 'Reconstruction error'})
+        return pd.DataFrame(info)
+
+    def reconstruct(self, df: pd.DataFrame) -> np.ndarray:
+        """Reconstruct the original signal from components (excludes residual)."""
+        # Use base components only, not residual
+        components = ['y_imf3', 'y_subdaily', 'y_vmd_daily', 'y_vmd_weekly', 'y_vmd_monthly', 'y_vmd_trend']
+        reconstructed = np.zeros(len(df))
+        for comp in components:
+            if comp in df.columns:
+                reconstructed += df[comp].values
+        return reconstructed
+
+
+# =============================================================================
+# Convenience Functions
+# =============================================================================
 
 def preprocess_for_forecast(
     df: pd.DataFrame,
     decompose: bool = True,
-    freq: int = 4,
-    savgol_mode: str = 'nearest',
+    freq: int = 96,
+    period_pairs: Optional[List[Tuple[float, float]]] = None,
+    filter_type: Literal['savgol', 'butterworth'] = 'butterworth',
     train_start_date: str | pd.Timestamp | None = None,
     train_end_date: str | pd.Timestamp | None = None,
-    lag_days: int | None = None,
+    **decomposer_kwargs
 ) -> pd.DataFrame:
-    """Preprocess data for forecasting with optional decomposition and date filtering.
-
-    This function prepares time series data by:
-    1. Optionally applying signal decomposition to extract frequency components
-    2. Filtering data to a specified date range
-    3. Ensuring sufficient history for lagged features
+    """Preprocess data for forecasting with optional bandpass decomposition.
 
     Args:
         df: Input dataframe with 'ds' and 'y' columns
         decompose: Whether to apply signal decomposition
-        freq: Data frequency in observations per day (for decomposition)
-        savgol_mode: Boundary mode for Savitzky-Golay filter ('nearest' recommended)
+        freq: Data frequency in observations per day
+        period_pairs: List of (period_low, period_high) tuples for decomposition
+        filter_type: Type of filter ('savgol' or 'butterworth')
         train_start_date: Start date for training data (inclusive)
-            - For NeuralProphet: '2023-09-10' or later recommended
-            - For Prophet: Uses lag_days before train_end_date if not specified
         train_end_date: End date for training data (inclusive)
-        lag_days: Number of historical observations needed for AR models
-            - If provided and train_start_date is None, automatically calculates start date
+        **decomposer_kwargs: Additional arguments for BandpassDecomposer
 
     Returns:
-        Preprocessed dataframe with:
-            - Filtered date range
-            - Decomposed components (if decompose=True)
-            - Sufficient history for lag_days (if specified)
+        Preprocessed dataframe with filtered date range and optional decomposition
 
     Example:
-        >>> # For NeuralProphet: decompose with date filtering
-        >>> df_train = preprocess_for_forecast(
+        >>> df_processed = preprocess_for_forecast(
         ...     df,
         ...     decompose=True,
-        ...     freq=4,
-        ...     train_start_date='2023-09-10',
-        ...     lag_days=48
-        ... )
-
-        >>> # For Prophet: just filter dates, use lag for history
-        >>> df_train = preprocess_for_forecast(
-        ...     df,
-        ...     decompose=False,
-        ...     train_end_date='2024-01-01',
-        ...     lag_days=48
+        ...     freq=96,
+        ...     period_pairs=[(0.5, 1.5), (1.5, 7), (7, 30)],
+        ...     filter_type='butterworth',
+        ...     train_end_date='2023-12-01',
         ... )
     """
     df = df.copy()
 
-    # Ensure ds is datetime
     if 'ds' in df.columns:
         df['ds'] = pd.to_datetime(df['ds'])
 
-    # Sort by timestamp
     df = df.sort_values('ds').reset_index(drop=True)
 
-    # Apply decomposition first on full history (if requested)
     if decompose:
-        decomposer = SignalDecomposer(freq=freq, mode='drop', savgol_mode=savgol_mode)
+        decomposer = BandpassDecomposer(
+            freq=freq,
+            period_pairs=period_pairs,
+            filter_type=filter_type,
+            mode='keep',
+            **decomposer_kwargs
+        )
         df = decomposer.decompose(df)
 
-    # Filter by date range
     if train_end_date is not None:
         train_end_date = pd.to_datetime(train_end_date)
         df = df[df['ds'] <= train_end_date]
@@ -293,32 +1043,94 @@ def preprocess_for_forecast(
     if train_start_date is not None:
         train_start_date = pd.to_datetime(train_start_date)
         df = df[df['ds'] >= train_start_date]
-    elif lag_days is not None and train_end_date is not None:
-        # If start date not specified but lag_days is, calculate it
-        # Ensure we have enough history before the cutoff
-        # lag_days is in observations, need to convert based on freq
-        if 'ds' in df.columns and len(df) > 0:
-            # Calculate time delta for lag_days observations
-            # Assuming uniform spacing, take median
-            if len(df) > 1:
-                time_diffs = df['ds'].diff().dropna()
-                median_diff = time_diffs.median()
-                lookback_period = median_diff * lag_days
-                calculated_start = train_end_date - lookback_period
-
-                # Add a buffer to ensure we have enough data
-                calculated_start = calculated_start - pd.Timedelta(days=1)
-
-                df = df[df['ds'] >= calculated_start]
-                print(f"Automatically set training start date to {calculated_start} "
-                      f"to ensure {lag_days} lag observations")
-
-    # Validate we have enough data
-    if lag_days is not None and len(df) < lag_days:
-        warnings.warn(
-            f"After preprocessing, only {len(df)} observations remain, "
-            f"but {lag_days} lag observations were requested. "
-            f"This may cause issues with AR models."
-        )
 
     return df.reset_index(drop=True)
+
+
+# =============================================================================
+# Example Usage
+# =============================================================================
+
+if __name__ == "__main__":
+    """Example usage and testing"""
+
+    # Create synthetic data (15-min frequency = 96 obs/day)
+    np.random.seed(42)
+    freq = 96
+    dates = pd.date_range('2023-01-01', '2023-07-01', freq='15min')
+    n = len(dates)
+    t = np.arange(n)
+
+    # Synthetic signal with multiple frequencies
+    y = (
+        6 * np.sin(2 * np.pi * t / (freq * 0.5)) +      # Sub-daily (12h)
+        10 * np.sin(2 * np.pi * t / freq) +              # Daily (24h)
+        5 * np.sin(2 * np.pi * t / (freq * 7)) +         # Weekly
+        3 * np.sin(2 * np.pi * t / (freq * 28)) +        # Monthly
+        np.random.randn(n) * 0.5 +                       # Noise
+        20 + 0.002 * t                                    # Trend
+    )
+
+    df = pd.DataFrame({'ds': dates, 'y': y})
+
+    # =========================================================================
+    # Test BandpassDecomposer
+    # =========================================================================
+    print("=" * 80)
+    print("Testing BandpassDecomposer (Butterworth)")
+    print("=" * 80)
+
+    decomposer = BandpassDecomposer(
+        freq=freq,
+        period_pairs=[
+            (0.25, 0.75),   # Sub-daily
+            (0.75, 1.25),   # Daily
+            (1.5, 7.0),     # Weekly
+            (7.0, 30.0),    # Monthly
+            (30.0, 180.0),  # Trend
+        ],
+        filter_type='butterworth',
+        edge_method='reflect',
+        edge_pad_periods=2.0,
+    )
+
+    df_decomposed = decomposer.decompose(df.copy())
+
+    print("\nComponent info:")
+    print(decomposer.get_component_info().to_string(index=False))
+
+    # Test reconstruction
+    reconstructed = decomposer.reconstruct(df_decomposed)
+    reconstruction_rmse = np.sqrt(np.mean((df_decomposed['y'].values - reconstructed) ** 2))
+    print(f"\nReconstruction RMSE: {reconstruction_rmse:.4f}")
+
+    # =========================================================================
+    # Test RubinVMDDecomposer (if vmdpy available)
+    # =========================================================================
+    if VMDPY_AVAILABLE:
+        print("\n" + "=" * 80)
+        print("Testing RubinVMDDecomposer")
+        print("=" * 80)
+
+        vmd_decomposer = RubinVMDDecomposer(
+            freq=freq,
+            alpha=2000,
+            K_stage1=5,
+            K_stage2=3,
+        )
+
+        df_vmd = vmd_decomposer.decompose(df.copy())
+
+        print("\nComponent info:")
+        print(vmd_decomposer.get_component_info().to_string(index=False))
+
+        # Test reconstruction
+        reconstructed_vmd = vmd_decomposer.reconstruct(df_vmd)
+        reconstruction_rmse_vmd = np.sqrt(np.mean((df_vmd['y'].values - reconstructed_vmd) ** 2))
+        print(f"\nReconstruction RMSE: {reconstruction_rmse_vmd:.4f}")
+    else:
+        print("\n[Skipping RubinVMDDecomposer test - vmdpy not installed]")
+
+    print("\n" + "=" * 80)
+    print("All tests complete!")
+    print("=" * 80)

@@ -13,6 +13,105 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 
+class DecomposerConfig(BaseModel):
+    """Configuration for signal decomposition.
+
+    Supports two decomposition methods:
+    - 'none': No decomposition (default)
+    - 'bandpass': BandpassDecomposer with period_pairs
+    - 'vmd': RubinVMDDecomposer (requires vmdpy)
+
+    Attributes:
+        method: Decomposition method ('none', 'bandpass', 'vmd')
+        freq: Observations per day (e.g., 96 for 15-min, 24 for hourly)
+        verbose: Whether to print decomposition info
+
+        BandpassDecomposer parameters:
+        period_pairs: List of (low, high) period pairs in days
+        filter_type: Filter type ('savgol' or 'butterworth')
+        edge_method: Edge handling method
+        edge_pad_periods: Padding for edge mitigation
+        nan_fill: NaN filling method
+        nan_fill_period: Period for periodic NaN filling
+        use_edge_weighting: Apply edge weighting
+        butter_order: Butterworth filter order
+
+        RubinVMDDecomposer parameters:
+        alpha: VMD bandwidth constraint
+        K_stage1: VMD modes for stage 1
+        K_stage2: VMD modes for stage 2
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    method: Literal['none', 'bandpass', 'vmd'] = Field(
+        default='none',
+        description="Decomposition method"
+    )
+
+    # Common parameters
+    freq: int = Field(default=96, ge=1, description="Observations per day")
+    verbose: bool = False
+    include_residual: bool = Field(
+        default=False,
+        description="Include residual (original - reconstructed) as a feature"
+    )
+
+    # BandpassDecomposer parameters
+    period_pairs: list[tuple[float, float]] | None = Field(
+        default=None,
+        description="List of (low, high) period pairs in days for bandpass"
+    )
+    filter_type: Literal['savgol', 'butterworth'] = Field(
+        default='butterworth',
+        description="Filter type for bandpass decomposition"
+    )
+    edge_method: Literal['none', 'reflect', 'symmetric', 'constant', 'extrapolate'] = Field(
+        default='reflect',
+        description="Edge handling method for bandpass"
+    )
+    edge_pad_periods: float = Field(
+        default=2.0,
+        ge=0.0,
+        description="Padding periods for edge mitigation"
+    )
+    nan_fill: Literal['periodic', 'linear', 'ffill'] = Field(
+        default='periodic',
+        description="NaN filling method"
+    )
+    nan_fill_period: float = Field(
+        default=1.0,
+        gt=0.0,
+        description="Period in days for periodic NaN filling"
+    )
+    use_edge_weighting: bool = Field(
+        default=False,
+        description="Apply edge weighting after filtering"
+    )
+    butter_order: int = Field(
+        default=4,
+        ge=1,
+        description="Butterworth filter order"
+    )
+
+    # RubinVMDDecomposer parameters
+    alpha: float = Field(
+        default=2000,
+        gt=0,
+        description="VMD bandwidth constraint"
+    )
+    K_stage1: int = Field(
+        default=5,
+        ge=1,
+        description="Number of VMD modes for stage 1"
+    )
+    K_stage2: int = Field(
+        default=3,
+        ge=1,
+        description="Number of VMD modes for stage 2"
+    )
+
+
 class BaseForecasterConfig(BaseModel):
     """Base configuration for all forecaster models.
 
@@ -21,15 +120,14 @@ class BaseForecasterConfig(BaseModel):
         lag_days: Number of historical days to use (NeuralProphet: n_lags, Prophet: training window)
         n_forecast: Number of steps to forecast ahead
         freq: Data frequency for training and forecasting (e.g., 'h', '15min', 'D')
-        freq_per_day: Observations per day (4=15min, 24=hourly) for decomposition
+        freq_per_day: Observations per day (4=15min, 24=hourly) - deprecated, use decomposer.freq
         yearly_seasonality: Enable yearly seasonality (bool or Fourier order)
         weekly_seasonality: Enable weekly seasonality (bool or Fourier order)
         daily_seasonality: Enable daily seasonality (bool or Fourier order)
         seasonality_mode: Type of seasonality decomposition
-        growth: Trend growth type
         n_changepoints: Number of potential changepoints for trend
         changepoints_range: Proportion of history for changepoint detection
-        use_decomposition: Whether to apply signal decomposition preprocessing
+        decomposer: Signal decomposition configuration
         train_start_date: Start date for training data (None = use all available)
         train_end_date: End date for training data (None = use all available)
     """
@@ -42,7 +140,7 @@ class BaseForecasterConfig(BaseModel):
 
     # Data frequency
     freq: str = Field(default='h', description="Pandas frequency string (e.g., 'h', '15min', 'D')")
-    freq_per_day: int = Field(default=4, ge=1, description="Observations per day (4=15min, 24=hourly)")
+    freq_per_day: int = Field(default=4, ge=1, description="Observations per day (deprecated, use decomposer.freq)")
 
     # Seasonality
     yearly_seasonality: bool | int = False
@@ -54,14 +152,23 @@ class BaseForecasterConfig(BaseModel):
     n_changepoints: int = Field(default=12, ge=0)
     changepoints_range: float = Field(default=0.85, gt=0.0, le=1.0)
 
-    # Preprocessing
-    use_decomposition: bool = Field(default=False, description="Apply signal decomposition preprocessing")
-    savgol_mode: Literal['mirror', 'nearest', 'constant', 'wrap', 'interp'] = Field(
-        default='nearest',
-        description="Savitzky-Golay filter boundary mode ('nearest' recommended for temp data)"
+    # Preprocessing - new nested config
+    decomposer: DecomposerConfig = Field(
+        default_factory=DecomposerConfig,
+        description="Signal decomposition configuration"
+    )
+    use_time_features: bool = Field(
+        default=False,
+        description="Add cyclic time features (hour_sin/cos, doy_sin/cos)"
     )
     train_start_date: str | None = Field(default=None, description="Start date for training (YYYY-MM-DD)")
     train_end_date: str | None = Field(default=None, description="End date for training (YYYY-MM-DD)")
+    model_dir: str | None = Field(default=None, description="Directory for saving/loading model checkpoints")
+
+    @property
+    def use_decomposition(self) -> bool:
+        """Backward compatibility property."""
+        return self.decomposer.method != 'none'
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> BaseForecasterConfig:
@@ -96,7 +203,8 @@ class BaseForecasterConfig(BaseModel):
         path.parent.mkdir(parents=True, exist_ok=True)
 
         with open(path, 'w') as f:
-            yaml.dump(self.model_dump(), f, default_flow_style=False, sort_keys=False)
+            # Use mode='json' to convert tuples to lists for YAML compatibility
+            yaml.dump(self.model_dump(mode='json'), f, default_flow_style=False, sort_keys=False)
 
 
 class ProphetConfig(BaseForecasterConfig):
@@ -148,11 +256,16 @@ class NeuralProphetConfig(BaseForecasterConfig):
     trend_reg: float = Field(default=1.0, ge=0.0)
 
     # Training
-    epochs: int = Field(default=15, ge=1)
+    epochs: int = Field(default=100, ge=1)
     batch_size: int = Field(default=128, ge=1)
     learning_rate: float = Field(default=0.003, gt=0.0)
     loss_func: str = "SmoothL1Loss"
     optimizer: str = "AdamW"
+
+    # Early stopping
+    early_stopping: bool = Field(default=True, description="Enable early stopping")
+    valid_pct: float = Field(default=0.1, ge=0.0, le=0.5, description="Validation set percentage")
+    patience: int = Field(default=10, ge=1, description="Reserved for future use (NeuralProphet doesn't expose this)")
 
     # Uncertainty
     quantiles: list[float] = Field(default_factory=lambda: [0.16, 0.84])

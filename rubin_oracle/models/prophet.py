@@ -13,12 +13,13 @@ import pandas as pd
 from prophet import Prophet
 from prophet.serialize import model_from_json, model_to_json
 
+from rubin_oracle.base import ValidationMixin
 from rubin_oracle.config import ProphetConfig
 from rubin_oracle.preprocessing import preprocess_for_forecast
 from rubin_oracle.utils import validate_input
 
 
-class ProphetForecaster:
+class ProphetForecaster(ValidationMixin):
     """Time series forecaster using Facebook Prophet.
 
     Implements the Forecaster protocol using Prophet for univariate
@@ -183,6 +184,53 @@ class ProphetForecaster:
         df = df[['ds', 'yhat', 'yhat_lower', 'yhat_upper', 'step']]
 
         return df
+
+    def _fit_and_predict(
+        self,
+        df_history: pd.DataFrame,
+        forecast_time: pd.Timestamp,
+    ) -> pd.DataFrame:
+        """Fit on history and generate forecast for validation.
+
+        Prophet requires refitting for each validation step since it doesn't
+        have autoregressive components that depend on recent observations.
+
+        Args:
+            df_history: Historical data up to forecast_time
+            forecast_time: The time at which the forecast is issued
+
+        Returns:
+            DataFrame with columns: ds, yhat1, yhat2, ..., yhat_lower1, yhat_upper1, ...
+        """
+        # Refit the model on historical data
+        self.fit(df_history)
+
+        # Generate forecast
+        forecast = self.predict(periods=self.config.n_forecast)
+
+        # Convert Prophet's single-step format to multi-step format
+        # Prophet returns: ds, yhat, yhat_lower, yhat_upper
+        # We need: ds, yhat1, yhat2, ..., yhat_lower1, yhat_upper1, ...
+        result_rows = []
+        for i, row in forecast.iterrows():
+            step = i + 1
+            result_rows.append({
+                'ds': row['ds'],
+                f'yhat{step}': row['yhat'],
+                f'yhat_lower{step}': row['yhat_lower'],
+                f'yhat_upper{step}': row['yhat_upper'],
+            })
+
+        # For Prophet, each row is a separate forecast step
+        # We return one row per target timestamp
+        df_result = forecast[['ds']].copy()
+        for step in range(1, self.config.n_forecast + 1):
+            if step <= len(forecast):
+                df_result[f'yhat{step}'] = forecast.iloc[step - 1]['yhat']
+                df_result[f'yhat_lower{step}'] = forecast.iloc[step - 1]['yhat_lower']
+                df_result[f'yhat_upper{step}'] = forecast.iloc[step - 1]['yhat_upper']
+
+        return df_result
 
     def save(self, path: str | Path) -> None:
         """Save the fitted Prophet model to disk.

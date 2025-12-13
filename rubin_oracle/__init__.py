@@ -22,13 +22,27 @@ Example:
     >>> standardized = model.standardize_output(predictions)
 """
 
-from rubin_oracle.base import Forecaster
+from rubin_oracle.base import (
+    Forecaster,
+    ValidationMixin,
+    RetrainingStrategy,
+    NoRetraining,
+    MonthlyRetraining,
+    DailyRetraining,
+)
 from rubin_oracle.config import (
     BaseForecasterConfig,
+    DecomposerConfig,
     NeuralProphetConfig,
     ProphetConfig,
 )
 from rubin_oracle.models import ProphetForecaster
+from rubin_oracle.preprocessing import (
+    BandpassDecomposer,
+    RubinVMDDecomposer,
+    fill_nan_periodic,
+    preprocess_for_forecast,
+)
 
 __version__ = "0.1.0"
 
@@ -41,10 +55,24 @@ except ImportError:
 
 # Define public API
 __all__ = [
+    # Base classes and protocols
     'Forecaster',
+    'ValidationMixin',
+    'RetrainingStrategy',
+    'NoRetraining',
+    'MonthlyRetraining',
+    'DailyRetraining',
+    # Configs
     'BaseForecasterConfig',
+    'DecomposerConfig',
     'ProphetConfig',
     'NeuralProphetConfig',
+    # Preprocessing
+    'BandpassDecomposer',
+    'RubinVMDDecomposer',
+    'fill_nan_periodic',
+    'preprocess_for_forecast',
+    # Forecasters
     'ProphetForecaster',
 ]
 
