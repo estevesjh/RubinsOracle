@@ -94,6 +94,17 @@ class DecomposerConfig(BaseModel):
         description="Butterworth filter order"
     )
 
+    # Savitzky-Golay specific parameters
+    savgol_polyorder: int = Field(
+        default=3,
+        ge=1,
+        description="Polynomial order for Savitzky-Golay filter"
+    )
+    savgol_butter_cleanup: bool = Field(
+        default=True,
+        description="Apply Butterworth bandpass after Savitzky-Golay for cleanup"
+    )
+
     # RubinVMDDecomposer parameters
     alpha: float = Field(
         default=2000,
@@ -164,6 +175,11 @@ class BaseForecasterConfig(BaseModel):
     train_start_date: str | None = Field(default=None, description="Start date for training (YYYY-MM-DD)")
     train_end_date: str | None = Field(default=None, description="End date for training (YYYY-MM-DD)")
     model_dir: str | None = Field(default=None, description="Directory for saving/loading model checkpoints")
+    train_on_all_history: bool = Field(
+        default=False,
+        description="If True, train on all available data instead of limiting to lag_days. "
+                    "Useful for ensemble components where decomposed signals benefit from full history."
+    )
 
     @property
     def use_decomposition(self) -> bool:
@@ -224,6 +240,13 @@ class ProphetConfig(BaseForecasterConfig):
     changepoint_prior_scale: float = Field(default=0.05, gt=0.0)
     seasonality_prior_scale: float = Field(default=10.0, gt=0.0)
     interval_width: float = Field(default=0.68, gt=0.0, lt=1.0)
+    growth: Literal["linear", "flat"] = Field(default="linear", description="Trend growth type")
+
+    # Custom seasonality periods (similar to bandpass period_pairs)
+    custom_seasonalities: list[dict] | None = Field(
+        default=None,
+        description="List of custom seasonality definitions: [{name, period, fourier_order}]"
+    )
 
 
 class NeuralProphetConfig(BaseForecasterConfig):
@@ -263,7 +286,7 @@ class NeuralProphetConfig(BaseForecasterConfig):
     optimizer: str = "AdamW"
 
     # Early stopping
-    early_stopping: bool = Field(default=True, description="Enable early stopping")
+    early_stopping: bool = Field(default=False, description="Enable early stopping")
     valid_pct: float = Field(default=0.1, ge=0.0, le=0.5, description="Validation set percentage")
     patience: int = Field(default=10, ge=1, description="Reserved for future use (NeuralProphet doesn't expose this)")
 
@@ -273,3 +296,144 @@ class NeuralProphetConfig(BaseForecasterConfig):
     # Data handling
     drop_missing: bool = True
     impute_missing: bool = True
+
+
+# ============================================================================
+# Ensemble Forecaster Configuration
+# ============================================================================
+
+class SeasonalityConfig(BaseModel):
+    """Seasonality definition for Prophet/NeuralProphet components.
+
+    Attributes:
+        name: Seasonality name (e.g., "daily", "weekly")
+        period: Period in days (e.g., 1.0 for daily, 7.0 for weekly)
+        fourier_order: Number of Fourier terms
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    period: float = Field(gt=0.0)
+    fourier_order: int = Field(ge=1)
+
+
+class ComponentConfig(BaseModel):
+    """Configuration for one component model in an ensemble.
+
+    Each component operates on a subset of decomposed frequency bands,
+    optionally at a different resolution (downsampled).
+
+    Attributes:
+        name: Component identifier (e.g., "high_freq", "low_freq")
+        model_type: Type of model to use
+        band_indices: Which decomposed bands to sum for this component
+        downsample_to: Optional resampling frequency (e.g., "4h")
+        lag_days: Days of history for this component
+        seasonalities: Custom seasonality definitions
+        use_lagged_regressors: Use other bands as lagged regressors (NeuralProphet)
+        ar_layers: AR hidden layer sizes (NeuralProphet)
+        ar_reg: AR regularization strength (NeuralProphet)
+        changepoint_prior_scale: Trend flexibility (Prophet)
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    model_type: Literal["prophet", "neural_prophet"]
+
+    # Frequency band assignment
+    band_indices: list[int] = Field(min_length=1)
+
+    # Resolution handling
+    resolution: str = Field(default="15min", description="Native data resolution")
+    downsample_to: str | None = Field(default=None, description="Target resolution for downsampling")
+
+    # Training window
+    lag_days: int = Field(default=7, ge=1, description="Days of history for this component")
+
+    # Seasonalities (for both Prophet and NeuralProphet)
+    seasonalities: list[SeasonalityConfig] = Field(default_factory=list)
+
+    # NeuralProphet-specific options
+    use_lagged_regressors: bool = Field(
+        default=False,
+        description="Use other bands as lagged regressors (NeuralProphet only)"
+    )
+    ar_layers: list[int] = Field(
+        default_factory=list,
+        description="AR hidden layer sizes (empty = linear AR)"
+    )
+    ar_reg: float = Field(default=1.0, ge=0.0, description="AR regularization strength")
+
+    # Prophet-specific options
+    n_changepoints: int = Field(default=25, ge=0, description="Number of potential changepoints")
+    changepoint_prior_scale: float = Field(default=0.05, gt=0.0)
+    growth: Literal["linear", "flat"] = Field(default="linear", description="Trend growth type")
+
+    # NeuralProphet training options
+    epochs: int = Field(default=100, ge=1, description="Training epochs (NeuralProphet)")
+    learning_rate: float = Field(default=0.003, gt=0.0, description="Learning rate (NeuralProphet)")
+
+
+class PostProcessorConfig(BaseModel):
+    """Post-processing options after combining component forecasts.
+
+    Attributes:
+        bias_correction: Apply bias correction
+        bias_window_hours: Lookback window for computing bias
+        bias_method: Method for bias estimation
+        bias_for_neural_prophet: Apply bias correction for NeuralProphet components
+        ets_blend: Blend with exponential smoothing for short-term
+        ets_tau: ETS decay constant in steps
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    # Bias correction (primarily for Prophet)
+    bias_correction: bool = Field(default=True, description="Apply bias correction")
+    bias_window_hours: float = Field(default=6.0, gt=0.0, description="Lookback window for residuals")
+    bias_method: Literal["median", "mean", "last"] = Field(default="median")
+    bias_for_neural_prophet: bool = Field(
+        default=False,
+        description="Apply bias correction for NeuralProphet (usually not needed due to AR)"
+    )
+
+    # ETS blending
+    ets_blend: bool = Field(default=False, description="Blend with exponential smoothing")
+    ets_tau: int = Field(default=16, ge=1, description="ETS decay constant in steps")
+
+
+class EnsembleConfig(BaseForecasterConfig):
+    """Configuration for EnsembleForecaster.
+
+    Combines multiple Prophet/NeuralProphet models operating on different
+    frequency bands from signal decomposition.
+
+    Attributes:
+        name: Fixed to "ensemble"
+        decomposer: Signal decomposition configuration (inherited)
+        components: List of component model configurations (2-4)
+        combine_method: How to combine component forecasts
+        component_weights: Weights for weighted combination
+        post_processor: Post-processing options
+        output_freq: Output resolution
+    """
+
+    name: Literal["ensemble"] = "ensemble"
+
+    # Component models (2-4 components)
+    components: list[ComponentConfig] = Field(min_length=2, max_length=4)
+
+    # Combination strategy
+    combine_method: Literal["sum", "weighted", "reconcile"] = Field(
+        default="sum",
+        description="Method for combining component forecasts: sum, weighted, or reconcile (learned weights)"
+    )
+    component_weights: list[float] | None = Field(
+        default=None,
+        description="Weights for weighted combination (must sum to 1.0)"
+    )
+
+    # Post-processing
+    post_processor: PostProcessorConfig = Field(default_factory=PostProcessorConfig)
+
+    # Output resolution
+    output_freq: str = Field(default="15min", description="Output forecast resolution")

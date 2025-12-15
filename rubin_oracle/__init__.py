@@ -28,6 +28,8 @@ from rubin_oracle.base import (
     RetrainingStrategy,
     NoRetraining,
     MonthlyRetraining,
+    WeeklyRetraining,
+    BiWeeklyRetraining,
     DailyRetraining,
 )
 from rubin_oracle.config import (
@@ -35,8 +37,13 @@ from rubin_oracle.config import (
     DecomposerConfig,
     NeuralProphetConfig,
     ProphetConfig,
+    # Ensemble configs
+    SeasonalityConfig,
+    ComponentConfig,
+    PostProcessorConfig,
+    EnsembleConfig,
 )
-from rubin_oracle.models import ProphetForecaster
+from rubin_oracle.models import ProphetForecaster, EnsembleForecaster
 from rubin_oracle.preprocessing import (
     BandpassDecomposer,
     RubinVMDDecomposer,
@@ -61,12 +68,19 @@ __all__ = [
     'RetrainingStrategy',
     'NoRetraining',
     'MonthlyRetraining',
+    'WeeklyRetraining',
+    'BiWeeklyRetraining',
     'DailyRetraining',
     # Configs
     'BaseForecasterConfig',
     'DecomposerConfig',
     'ProphetConfig',
     'NeuralProphetConfig',
+    # Ensemble configs
+    'SeasonalityConfig',
+    'ComponentConfig',
+    'PostProcessorConfig',
+    'EnsembleConfig',
     # Preprocessing
     'BandpassDecomposer',
     'RubinVMDDecomposer',
@@ -74,6 +88,7 @@ __all__ = [
     'preprocess_for_forecast',
     # Forecasters
     'ProphetForecaster',
+    'EnsembleForecaster',
 ]
 
 if _has_neural:

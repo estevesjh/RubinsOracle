@@ -62,6 +62,48 @@ class DailyRetraining:
         return False
 
 
+class WeeklyRetraining:
+    """Retrain model once per week."""
+
+    def __init__(self):
+        self.last_retrain_week = None
+
+    def should_retrain(self, forecast_time: pd.Timestamp) -> bool:
+        current_week = (forecast_time.year, forecast_time.isocalendar()[1])
+        if self.last_retrain_week is None or current_week != self.last_retrain_week:
+            self.last_retrain_week = current_week
+            return True
+        return False
+
+
+class BiWeeklyRetraining:
+    """Retrain model every two weeks."""
+
+    def __init__(self):
+        self.last_retrain_week = None
+
+    def should_retrain(self, forecast_time: pd.Timestamp) -> bool:
+        current_week = (forecast_time.year, forecast_time.isocalendar()[1])
+
+        if self.last_retrain_week is None:
+            self.last_retrain_week = current_week
+            return True
+
+        last_year, last_week_num = self.last_retrain_week
+        curr_year, curr_week_num = current_week
+
+        # Calculate weeks difference
+        if curr_year == last_year:
+            weeks_diff = curr_week_num - last_week_num
+        else:
+            weeks_diff = (52 - last_week_num) + curr_week_num + 52 * (curr_year - last_year - 1)
+
+        if weeks_diff >= 2:
+            self.last_retrain_week = current_week
+            return True
+        return False
+
+
 # =============================================================================
 # Validation Mixin
 # =============================================================================
