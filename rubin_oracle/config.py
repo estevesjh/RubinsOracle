@@ -44,83 +44,53 @@ class DecomposerConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    method: Literal['none', 'bandpass', 'vmd'] = Field(
-        default='none',
-        description="Decomposition method"
+    method: Literal["none", "bandpass", "vmd"] = Field(
+        default="none", description="Decomposition method"
     )
 
     # Common parameters
     freq: int = Field(default=96, ge=1, description="Observations per day")
     verbose: bool = False
     include_residual: bool = Field(
-        default=False,
-        description="Include residual (original - reconstructed) as a feature"
+        default=False, description="Include residual (original - reconstructed) as a feature"
     )
 
     # BandpassDecomposer parameters
     period_pairs: list[tuple[float, float]] | None = Field(
-        default=None,
-        description="List of (low, high) period pairs in days for bandpass"
+        default=None, description="List of (low, high) period pairs in days for bandpass"
     )
-    filter_type: Literal['savgol', 'butterworth'] = Field(
-        default='butterworth',
-        description="Filter type for bandpass decomposition"
+    filter_type: Literal["savgol", "butterworth"] = Field(
+        default="butterworth", description="Filter type for bandpass decomposition"
     )
-    edge_method: Literal['none', 'reflect', 'symmetric', 'constant', 'extrapolate'] = Field(
-        default='reflect',
-        description="Edge handling method for bandpass"
+    edge_method: Literal["none", "reflect", "symmetric", "constant", "extrapolate"] = Field(
+        default="reflect", description="Edge handling method for bandpass"
     )
     edge_pad_periods: float = Field(
-        default=2.0,
-        ge=0.0,
-        description="Padding periods for edge mitigation"
+        default=2.0, ge=0.0, description="Padding periods for edge mitigation"
     )
-    nan_fill: Literal['periodic', 'linear', 'ffill'] = Field(
-        default='periodic',
-        description="NaN filling method"
+    nan_fill: Literal["periodic", "linear", "ffill"] = Field(
+        default="periodic", description="NaN filling method"
     )
     nan_fill_period: float = Field(
-        default=1.0,
-        gt=0.0,
-        description="Period in days for periodic NaN filling"
+        default=1.0, gt=0.0, description="Period in days for periodic NaN filling"
     )
     use_edge_weighting: bool = Field(
-        default=False,
-        description="Apply edge weighting after filtering"
+        default=False, description="Apply edge weighting after filtering"
     )
-    butter_order: int = Field(
-        default=4,
-        ge=1,
-        description="Butterworth filter order"
-    )
+    butter_order: int = Field(default=4, ge=1, description="Butterworth filter order")
 
     # Savitzky-Golay specific parameters
     savgol_polyorder: int = Field(
-        default=3,
-        ge=1,
-        description="Polynomial order for Savitzky-Golay filter"
+        default=3, ge=1, description="Polynomial order for Savitzky-Golay filter"
     )
     savgol_butter_cleanup: bool = Field(
-        default=True,
-        description="Apply Butterworth bandpass after Savitzky-Golay for cleanup"
+        default=True, description="Apply Butterworth bandpass after Savitzky-Golay for cleanup"
     )
 
     # RubinVMDDecomposer parameters
-    alpha: float = Field(
-        default=2000,
-        gt=0,
-        description="VMD bandwidth constraint"
-    )
-    K_stage1: int = Field(
-        default=5,
-        ge=1,
-        description="Number of VMD modes for stage 1"
-    )
-    K_stage2: int = Field(
-        default=3,
-        ge=1,
-        description="Number of VMD modes for stage 2"
-    )
+    alpha: float = Field(default=2000, gt=0, description="VMD bandwidth constraint")
+    K_stage1: int = Field(default=5, ge=1, description="Number of VMD modes for stage 1")
+    K_stage2: int = Field(default=3, ge=1, description="Number of VMD modes for stage 2")
 
 
 class BaseForecasterConfig(BaseModel):
@@ -150,8 +120,10 @@ class BaseForecasterConfig(BaseModel):
     n_forecast: int = Field(default=48, ge=1)
 
     # Data frequency
-    freq: str = Field(default='h', description="Pandas frequency string (e.g., 'h', '15min', 'D')")
-    freq_per_day: int = Field(default=4, ge=1, description="Observations per day (deprecated, use decomposer.freq)")
+    freq: str = Field(default="h", description="Pandas frequency string (e.g., 'h', '15min', 'D')")
+    freq_per_day: int = Field(
+        default=4, ge=1, description="Observations per day (deprecated, use decomposer.freq)"
+    )
 
     # Seasonality
     yearly_seasonality: bool | int = False
@@ -165,26 +137,30 @@ class BaseForecasterConfig(BaseModel):
 
     # Preprocessing - new nested config
     decomposer: DecomposerConfig = Field(
-        default_factory=DecomposerConfig,
-        description="Signal decomposition configuration"
+        default_factory=DecomposerConfig, description="Signal decomposition configuration"
     )
     use_time_features: bool = Field(
-        default=False,
-        description="Add cyclic time features (hour_sin/cos, doy_sin/cos)"
+        default=False, description="Add cyclic time features (hour_sin/cos, doy_sin/cos)"
     )
-    train_start_date: str | None = Field(default=None, description="Start date for training (YYYY-MM-DD)")
-    train_end_date: str | None = Field(default=None, description="End date for training (YYYY-MM-DD)")
-    model_dir: str | None = Field(default=None, description="Directory for saving/loading model checkpoints")
+    train_start_date: str | None = Field(
+        default=None, description="Start date for training (YYYY-MM-DD)"
+    )
+    train_end_date: str | None = Field(
+        default=None, description="End date for training (YYYY-MM-DD)"
+    )
+    model_dir: str | None = Field(
+        default=None, description="Directory for saving/loading model checkpoints"
+    )
     train_on_all_history: bool = Field(
         default=False,
         description="If True, train on all available data instead of limiting to lag_days. "
-                    "Useful for ensemble components where decomposed signals benefit from full history."
+        "Useful for ensemble components where decomposed signals benefit from full history.",
     )
 
     @property
     def use_decomposition(self) -> bool:
         """Backward compatibility property."""
-        return self.decomposer.method != 'none'
+        return self.decomposer.method != "none"
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> BaseForecasterConfig:
@@ -204,7 +180,7 @@ class BaseForecasterConfig(BaseModel):
         if not path.exists():
             raise FileNotFoundError(f"Config file not found: {path}")
 
-        with open(path, 'r') as f:
+        with open(path) as f:
             config_dict = yaml.safe_load(f)
 
         return cls(**config_dict)
@@ -218,9 +194,9 @@ class BaseForecasterConfig(BaseModel):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        with open(path, 'w') as f:
+        with open(path, "w") as f:
             # Use mode='json' to convert tuples to lists for YAML compatibility
-            yaml.dump(self.model_dump(mode='json'), f, default_flow_style=False, sort_keys=False)
+            yaml.dump(self.model_dump(mode="json"), f, default_flow_style=False, sort_keys=False)
 
 
 class ProphetConfig(BaseForecasterConfig):
@@ -245,7 +221,7 @@ class ProphetConfig(BaseForecasterConfig):
     # Custom seasonality periods (similar to bandpass period_pairs)
     custom_seasonalities: list[dict] | None = Field(
         default=None,
-        description="List of custom seasonality definitions: [{name, period, fourier_order}]"
+        description="List of custom seasonality definitions: [{name, period, fourier_order}]",
     )
 
 
@@ -288,7 +264,9 @@ class NeuralProphetConfig(BaseForecasterConfig):
     # Early stopping
     early_stopping: bool = Field(default=False, description="Enable early stopping")
     valid_pct: float = Field(default=0.1, ge=0.0, le=0.5, description="Validation set percentage")
-    patience: int = Field(default=10, ge=1, description="Reserved for future use (NeuralProphet doesn't expose this)")
+    patience: int = Field(
+        default=10, ge=1, description="Reserved for future use (NeuralProphet doesn't expose this)"
+    )
 
     # Uncertainty
     quantiles: list[float] = Field(default_factory=lambda: [0.16, 0.84])
@@ -302,6 +280,7 @@ class NeuralProphetConfig(BaseForecasterConfig):
 # Ensemble Forecaster Configuration
 # ============================================================================
 
+
 class SeasonalityConfig(BaseModel):
     """Seasonality definition for Prophet/NeuralProphet components.
 
@@ -310,6 +289,7 @@ class SeasonalityConfig(BaseModel):
         period: Period in days (e.g., 1.0 for daily, 7.0 for weekly)
         fourier_order: Number of Fourier terms
     """
+
     model_config = ConfigDict(extra="forbid")
 
     name: str
@@ -335,6 +315,7 @@ class ComponentConfig(BaseModel):
         ar_reg: AR regularization strength (NeuralProphet)
         changepoint_prior_scale: Trend flexibility (Prophet)
     """
+
     model_config = ConfigDict(extra="forbid")
 
     name: str
@@ -345,7 +326,9 @@ class ComponentConfig(BaseModel):
 
     # Resolution handling
     resolution: str = Field(default="15min", description="Native data resolution")
-    downsample_to: str | None = Field(default=None, description="Target resolution for downsampling")
+    downsample_to: str | None = Field(
+        default=None, description="Target resolution for downsampling"
+    )
 
     # Training window
     lag_days: int = Field(default=7, ge=1, description="Days of history for this component")
@@ -355,12 +338,10 @@ class ComponentConfig(BaseModel):
 
     # NeuralProphet-specific options
     use_lagged_regressors: bool = Field(
-        default=False,
-        description="Use other bands as lagged regressors (NeuralProphet only)"
+        default=False, description="Use other bands as lagged regressors (NeuralProphet only)"
     )
     ar_layers: list[int] = Field(
-        default_factory=list,
-        description="AR hidden layer sizes (empty = linear AR)"
+        default_factory=list, description="AR hidden layer sizes (empty = linear AR)"
     )
     ar_reg: float = Field(default=1.0, ge=0.0, description="AR regularization strength")
 
@@ -385,15 +366,18 @@ class PostProcessorConfig(BaseModel):
         ets_blend: Blend with exponential smoothing for short-term
         ets_tau: ETS decay constant in steps
     """
+
     model_config = ConfigDict(extra="forbid")
 
     # Bias correction (primarily for Prophet)
     bias_correction: bool = Field(default=True, description="Apply bias correction")
-    bias_window_hours: float = Field(default=6.0, gt=0.0, description="Lookback window for residuals")
+    bias_window_hours: float = Field(
+        default=6.0, gt=0.0, description="Lookback window for residuals"
+    )
     bias_method: Literal["median", "mean", "last"] = Field(default="median")
     bias_for_neural_prophet: bool = Field(
         default=False,
-        description="Apply bias correction for NeuralProphet (usually not needed due to AR)"
+        description="Apply bias correction for NeuralProphet (usually not needed due to AR)",
     )
 
     # ETS blending
@@ -423,13 +407,11 @@ class EnsembleConfig(BaseForecasterConfig):
     components: list[ComponentConfig] = Field(min_length=2, max_length=4)
 
     # Combination strategy
-    combine_method: Literal["sum", "weighted", "reconcile"] = Field(
-        default="sum",
-        description="Method for combining component forecasts: sum, weighted, or reconcile (learned weights)"
+    combine_method: Literal["sum", "weighted"] = Field(
+        default="sum", description="Method for combining component forecasts: sum or weighted"
     )
     component_weights: list[float] | None = Field(
-        default=None,
-        description="Weights for weighted combination (must sum to 1.0)"
+        default=None, description="Weights for weighted combination (must sum to 1.0)"
     )
 
     # Post-processing

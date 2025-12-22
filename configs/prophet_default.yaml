@@ -1,0 +1,38 @@
+name: prophet
+lag_days: 7
+n_forecast: 1
+model_dir: outputs/models/prophet
+
+# Data frequency
+freq: 15min
+freq_per_day: 96
+
+# Disable built-in seasonalities
+yearly_seasonality: false
+weekly_seasonality: false
+daily_seasonality: false
+seasonality_mode: additive
+
+# Custom seasonalities matching savgol_base periods
+custom_seasonalities:
+  - name: sub_daily
+    period: 0.5      # 12 hours
+    fourier_order: 13
+  - name: daily
+    period: 1.0      # 1 day
+    fourier_order: 13
+  - name: multi_day
+    period: 3.5      # ~3.5 days (center of 2.4-5 band)
+    fourier_order: 10
+  - name: weekly
+    period: 7.0      # 1 week
+    fourier_order: 10
+
+# Trend
+n_changepoints: 24
+changepoints_range: 0.85
+
+# Prophet-specific
+changepoint_prior_scale: 0.05
+seasonality_prior_scale: 10.0
+interval_width: 0.68

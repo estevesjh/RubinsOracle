@@ -6,30 +6,47 @@ for neural network-based time series forecasting.
 
 from __future__ import annotations
 
-from pathlib import Path
-import warnings
+import json
+import logging
 import os
-import sys
-import torch
+import warnings
+from pathlib import Path
 
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-from typing import Optional
+import numpy as np
+import pandas as pd
+import torch
+
+from rubin_oracle.base import ValidationMixin
+from rubin_oracle.config import NeuralProphetConfig
+from rubin_oracle.preprocessing import (
+    BandpassDecomposer,
+    RubinVMDDecomposer,
+)
+from rubin_oracle.utils import (
+    MetricsCalculator,
+    OutputFormatter,
+    prepare_regular_frequency,
+    validate_input,
+)
 
 # Force tqdm to show in terminal
 os.environ.setdefault("TQDM_DISABLE", "0")
 
 # Set PyTorch Lightning to show progress
-import logging
 logging.getLogger("pytorch_lightning").setLevel(logging.INFO)
 
 # Suppress NeuralProphet and PyTorch warnings
 # Monkeypatch torch.load to avoid weights_only warning
 _original_load = torch.load
+
+
 def safe_load(*a, **k):
     if "weights_only" not in k:
         k["weights_only"] = False
     return _original_load(*a, **k)
+
+
 torch.load = safe_load
 
 # Filter specific warnings
@@ -39,23 +56,12 @@ warnings.filterwarnings("ignore", message="weights_only=False")
 warnings.filterwarnings("ignore", message="concatenation with empty or all-NA")
 warnings.filterwarnings("ignore", message="DataFrame is highly fragmented")
 
-import json
-
-import numpy as np
-import pandas as pd
-
-from rubin_oracle.base import ValidationMixin
-from rubin_oracle.config import NeuralProphetConfig
-from rubin_oracle.preprocessing import BandpassDecomposer, RubinVMDDecomposer, preprocess_for_forecast
-from rubin_oracle.utils import prepare_regular_frequency, validate_input
-
 try:
-    from neuralprophet import NeuralProphet, save, load
-except ImportError:
+    from neuralprophet import NeuralProphet, load, save
+except ImportError as err:
     raise ImportError(
-        "NeuralProphet is required but not installed. "
-        "Install it with: pip install neuralprophet"
-    )
+        "NeuralProphet is required but not installed. " "Install it with: pip install neuralprophet"
+    ) from err
 
 
 def _lead_time_to_step(lead_time: float, freq: str, n_forecast: int) -> int:
@@ -77,10 +83,7 @@ def _lead_time_to_step(lead_time: float, freq: str, n_forecast: int) -> int:
         lead_td = pd.Timedelta(hours=lead_time)
         freq_td = pd.to_timedelta(freq)
     except Exception as e:
-        raise ValueError(
-            f"Invalid lead_time '{lead_time}' or freq '{freq}'. "
-            f"Error: {e}"
-        ) from e
+        raise ValueError(f"Invalid lead_time '{lead_time}' or freq '{freq}'. " f"Error: {e}") from e
 
     # Calculate step
     if freq_td <= pd.Timedelta(0):
@@ -149,13 +152,13 @@ class NeuralProphetForecaster(ValidationMixin):
         Returns:
             DataFrame with decomposed component columns added
         """
-        if self.config.decomposer.method == 'none':
+        if self.config.decomposer.method == "none":
             return df
 
         if self._decomposer is None:
             cfg = self.config.decomposer
 
-            if cfg.method == 'bandpass':
+            if cfg.method == "bandpass":
                 self._decomposer = BandpassDecomposer(
                     freq=cfg.freq,
                     period_pairs=cfg.period_pairs,
@@ -169,7 +172,7 @@ class NeuralProphetForecaster(ValidationMixin):
                     verbose=cfg.verbose,
                     include_residual=cfg.include_residual,
                 )
-            elif cfg.method == 'vmd':
+            elif cfg.method == "vmd":
                 self._decomposer = RubinVMDDecomposer(
                     freq=cfg.freq,
                     alpha=cfg.alpha,
@@ -195,14 +198,14 @@ class NeuralProphetForecaster(ValidationMixin):
         df = df.copy()
 
         # Hour of day (0-23) -> cyclic encoding
-        hour = df['ds'].dt.hour + df['ds'].dt.minute / 60.0
-        df['hour_sin'] = np.sin(2 * np.pi * hour / 24.0)
-        df['hour_cos'] = np.cos(2 * np.pi * hour / 24.0)
+        hour = df["ds"].dt.hour + df["ds"].dt.minute / 60.0
+        df["hour_sin"] = np.sin(2 * np.pi * hour / 24.0)
+        df["hour_cos"] = np.cos(2 * np.pi * hour / 24.0)
 
         # Day of year (1-366) -> cyclic encoding
-        doy = df['ds'].dt.dayofyear
-        df['doy_sin'] = np.sin(2 * np.pi * doy / 365.25)
-        df['doy_cos'] = np.cos(2 * np.pi * doy / 365.25)
+        doy = df["ds"].dt.dayofyear
+        df["doy_sin"] = np.sin(2 * np.pi * doy / 365.25)
+        df["doy_cos"] = np.cos(2 * np.pi * doy / 365.25)
 
         return df
 
@@ -219,10 +222,7 @@ class NeuralProphetForecaster(ValidationMixin):
 
         # Add decomposed component columns
         if self.config.use_decomposition:
-            candidate_cols = [
-                c for c in df.columns
-                if c.startswith('y_') and c not in ['y_trend']
-            ]
+            candidate_cols = [c for c in df.columns if c.startswith("y_") and c not in ["y_trend"]]
 
             # Filter by variance threshold to remove near-constant features
             variance_threshold = 1e-6
@@ -231,7 +231,7 @@ class NeuralProphetForecaster(ValidationMixin):
                     valid_cols.append(col)
 
         # Add time features if present
-        time_features = ['hour_sin', 'hour_cos', 'doy_sin', 'doy_cos']
+        time_features = ["hour_sin", "hour_cos", "doy_sin", "doy_cos"]
         for col in time_features:
             if col in df.columns:
                 valid_cols.append(col)
@@ -243,7 +243,7 @@ class NeuralProphetForecaster(ValidationMixin):
         df: pd.DataFrame,
         window_size: int | None = None,
         verbose: bool = False,
-    ) -> 'NeuralProphetForecaster':
+    ) -> NeuralProphetForecaster:
         """Fit the NeuralProphet model to training data.
 
         Args:
@@ -265,11 +265,11 @@ class NeuralProphetForecaster(ValidationMixin):
         # Apply date filtering from config
         if self.config.train_end_date is not None:
             end_date = pd.to_datetime(self.config.train_end_date)
-            df = df[df['ds'] <= end_date]
+            df = df[df["ds"] <= end_date]
 
         if self.config.train_start_date is not None:
             start_date = pd.to_datetime(self.config.train_start_date)
-            df = df[df['ds'] >= start_date]
+            df = df[df["ds"] >= start_date]
 
         # Apply window size limit
         if window_size is not None and len(df) > window_size:
@@ -297,7 +297,7 @@ class NeuralProphetForecaster(ValidationMixin):
             print(f"Regressor columns: {len(self._regressor_cols)}")
 
         # Prepare data for NeuralProphet
-        cols_to_keep = ['ds', 'y'] + self._regressor_cols
+        cols_to_keep = ["ds", "y"] + self._regressor_cols
         df_model = df[[c for c in cols_to_keep if c in df.columns]].copy()
 
         # Ensure regular frequency
@@ -305,7 +305,7 @@ class NeuralProphetForecaster(ValidationMixin):
 
         # Handle missing values
         if self.config.impute_missing:
-            df_model = df_model.interpolate(method='linear')
+            df_model = df_model.interpolate(method="linear")
 
         # Initialize NeuralProphet
         self.model_ = NeuralProphet(
@@ -338,7 +338,7 @@ class NeuralProphetForecaster(ValidationMixin):
 
         # keep the fitted dataset
         self._fit_df = df_model
-        self.latest_timestamp = df_model['ds'].max()
+        self.latest_timestamp = df_model["ds"].max()
 
         # Compute standardized metrics
         self._compute_metrics(df_model)
@@ -360,17 +360,17 @@ class NeuralProphetForecaster(ValidationMixin):
             fitted = self.predict(df)
 
             # Merge to get y values aligned with predictions
-            df_eval = df[['ds', 'y']].copy()
-            if df_eval['ds'].dt.tz is not None:
-                df_eval['ds'] = df_eval['ds'].dt.tz_localize(None)
-            if fitted['ds'].dt.tz is not None:
-                fitted['ds'] = fitted['ds'].dt.tz_localize(None)
+            df_eval = df[["ds", "y"]].copy()
+            if df_eval["ds"].dt.tz is not None:
+                df_eval["ds"] = df_eval["ds"].dt.tz_localize(None)
+            if fitted["ds"].dt.tz is not None:
+                fitted["ds"] = fitted["ds"].dt.tz_localize(None)
 
-            merged = fitted.merge(df_eval, on='ds', how='inner')
+            merged = fitted.merge(df_eval, on="ds", how="inner")
 
             # Use yhat1 as the primary prediction
-            yhat_col = 'yhat1' if 'yhat1' in merged.columns else 'yhat'
-            y_true = merged['y'].dropna().values
+            yhat_col = "yhat1" if "yhat1" in merged.columns else "yhat"
+            y_true = merged["y"].dropna().values
             y_pred = merged[yhat_col].dropna().values
 
             # Ensure same length
@@ -382,25 +382,9 @@ class NeuralProphetForecaster(ValidationMixin):
                 self.metrics_ = None
                 return
 
-            # Compute metrics
-            residuals = y_true - y_pred
-            n = len(y_true)
-
-            rmse = np.sqrt(np.mean(residuals ** 2))
-            mae = np.mean(np.abs(residuals))
-
-            # R² (coefficient of determination)
-            ss_res = np.sum(residuals ** 2)
-            ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
-            r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
-
-            self.metrics_ = {
-                'rmse': rmse,
-                'mae': mae,
-                'r2': r2,
-                'n_samples': n,
-            }
-        except Exception as e:
+            # Compute metrics using helper
+            self.metrics_ = MetricsCalculator.compute_metrics(y_true, y_pred)
+        except Exception:
             # If metrics computation fails, set to None
             self.metrics_ = None
 
@@ -411,17 +395,17 @@ class NeuralProphetForecaster(ValidationMixin):
         window approach.
 
         **NeuralProphet Idiosyncrasies:**
-        
+
         NeuralProphet operates as an autoregressive model with a rolling window of size
         `lag_days`. When you call predict(df), it produces forecasts with multiple steps
         (yhat1, yhat2, ..., yhat{n_forecast}). Each yhat_i represents a forecast i steps
         ahead from its reference timestamp.
-        
+
         However, NeuralProphet only returns predictions where there are enough future
         values to reference. If your dataframe ends at time T, predictions at T will have
         references up to T+n_forecast. Rows near the end (after T - n_forecast) won't have
         valid yhat1 values because there's no future data to predict from.
-        
+
         **Solution:** Extend the input df with NaN values for n_forecast periods. This gives
         every historical point enough "future" to reference, ensuring all timestamps get
         valid yhat1, yhat2, ..., yhat{n_forecast} values.
@@ -436,18 +420,14 @@ class NeuralProphetForecaster(ValidationMixin):
             RuntimeError: If model hasn't been fitted yet
         """
         if self.model_ is None:
-            raise RuntimeError(
-                "Model has not been fitted yet. Call fit() before fitted()."
-            )
+            raise RuntimeError("Model has not been fitted yet. Call fit() before fitted().")
 
-        if not hasattr(self, '_fit_df'):
-            raise RuntimeError(
-                "Fitted data not available. Ensure fit() was called properly."
-            )
+        if not hasattr(self, "_fit_df"):
+            raise RuntimeError("Fitted data not available. Ensure fit() was called properly.")
 
         return self.predict(self._fit_df, include_history=True)
-    
-    def forecast(self, df_test: pd.DataFrame, include_history: Optional[bool] = True) -> pd.DataFrame:
+
+    def forecast(self, df_test: pd.DataFrame, include_history: bool | None = True) -> pd.DataFrame:
         """Generate forecasts for test data using proper rolling window approach.
 
         This method addresses NeuralProphet's rolling window requirements by constructing
@@ -491,41 +471,41 @@ class NeuralProphetForecaster(ValidationMixin):
         """
         if include_history:
             issue_time = self.latest_timestamp
-            df_test_up = df_test[df_test['ds'] > issue_time]
-            history = self._fit_df.tail(self.config.n_forecast+self.config.lag_days)
+            df_test_up = df_test[df_test["ds"] > issue_time]
+            history = self._fit_df.tail(self.config.n_forecast + self.config.lag_days)
             df_input = pd.concat([history, df_test_up])
         else:
             df_input = df_test
         return self.predict(df_input)
 
-    def predict(self, df: pd.DataFrame, include_history: Optional[bool] = False) -> pd.DataFrame:
+    def predict(self, df: pd.DataFrame, include_history: bool | None = False) -> pd.DataFrame:
         """Generate forecasts using NeuralProphet with rolling window approach.
 
         Extends input df with NaN values up to n_forecast steps to ensure all historical
         timestamps have valid multi-step forecasts (yhat1, yhat2, ..., yhat{n_forecast}).
 
         **NeuralProphet Idiosyncrasies (Important):**
-        
+
         NeuralProphet makes rolling window predictions where each yhat_i is a forecast
         i steps ahead. For a given timestamp t:
         - yhat1 = forecast for t+1 (next period)
         - yhat2 = forecast for t+2
         - ...
         - yhat{n_forecast} = forecast for t+n_forecast
-        
+
         The critical quirk: NeuralProphet only produces valid predictions when the input
         dataframe has future values to reference. If your df ends at timestamp T, only
         timestamps up to T - n_forecast will have valid yhat1 values. Rows after that
         will be NaN because there's insufficient future data.
-        
+
         **This method solves this by:**
         1. Taking the input df
         2. Extending it with n_forecast NaN rows to simulate future values
         3. Passing the extended df directly to model.predict()
-        
+
         Now every timestamp in the original df has n_forecast rows after it, so all
         yhat1, yhat2, ..., yhat{n_forecast} columns will have valid values.
-        
+
         The extended NaN rows are a side effect - the forecast you care about is for
         the original df rows. You can merge the forecast back to the original df by
         joining on 'ds'.
@@ -540,18 +520,16 @@ class NeuralProphetForecaster(ValidationMixin):
                 - ds: Forecast timestamps (includes both original and NaN-extended rows)
                 - yhat1, yhat2, ...: Point forecasts for each step
                 - yhat_lower1, yhat_upper1, ...: Uncertainty bounds (if quantiles configured)
-            
+
             Note: Predictions for the NaN-extended rows may be less reliable than
             the original df rows.
 
         Raises:
             RuntimeError: If model hasn't been fitted yet
             ValueError: If df is None or has insufficient data
-        """        
+        """
         if self.model_ is None:
-            raise RuntimeError(
-                "Model has not been fitted yet. Call fit() before predict()."
-            )
+            raise RuntimeError("Model has not been fitted yet. Call fit() before predict().")
 
         if df is None:
             raise ValueError(
@@ -589,10 +567,10 @@ class NeuralProphetForecaster(ValidationMixin):
         forecast = self.model_.predict(df_extended, decompose=False)
 
         # Ensure ds is in local time (America/Santiago)
-        if forecast['ds'].dt.tz is None:
-            forecast['ds'] = forecast['ds'].dt.tz_localize('UTC').dt.tz_convert('America/Santiago')
+        if forecast["ds"].dt.tz is None:
+            forecast["ds"] = forecast["ds"].dt.tz_localize("UTC").dt.tz_convert("America/Santiago")
         else:
-            forecast['ds'] = forecast['ds'].dt.tz_convert('America/Santiago')
+            forecast["ds"] = forecast["ds"].dt.tz_convert("America/Santiago")
 
         return forecast
 
@@ -604,18 +582,6 @@ class NeuralProphetForecaster(ValidationMixin):
         with yhat1, yhat2, ..., yhat{n_forecast} columns) to a long format (one row per
         step per forecast timestamp).
 
-        **Output Format:**
-
-        The standardized output has one row for each combination of (forecast_timestamp, step):
-        - forecast_timestamp at t with steps 1..n_forecast produces n_forecast rows
-        - Each row contains: ds, step, yhat for that specific step
-
-        This format is useful for:
-        - Step-specific analysis (e.g., comparing accuracy by forecast horizon)
-        - Plotting forecast trajectories
-        - Computing metrics per step
-        - Integration with other forecasting frameworks
-
         Args:
             forecast: NeuralProphet forecast output with columns:
                 - ds: Forecast timestamp
@@ -624,90 +590,11 @@ class NeuralProphetForecaster(ValidationMixin):
 
         Returns:
             DataFrame with standardized columns in long format:
-                - ds: Forecast timestamp (from original forecast)
-                - step: Forecast step (1 to n_forecast)
-                - yhat: Point forecast value for this step
-                - (optional) yhat_lower: Lower uncertainty bound (if available)
-                - (optional) yhat_upper: Upper uncertainty bound (if available)
-
-            One row per step per forecast timestamp (exploded format).
-
-            Example output:
-                ds                 step  yhat      yhat_lower  yhat_upper
-                2024-01-01 10:00   1     105.2     103.1       107.3
-                2024-01-01 10:00   2     104.8     102.5       107.1
-                2024-01-01 10:00   3     104.5     102.0       107.0
-                2024-01-01 10:15   1     106.3     104.2       108.4
-                2024-01-01 10:15   2     105.9     103.6       108.2
-
-        Raises:
-            ValueError: If forecast doesn't have required 'ds' column
-            ValueError: If no yhat columns are found
-
-        Example:
-            >>> forecaster.fit(df_train)
-            >>> forecast = forecaster.predict(df_recent)
-            >>> standardized = forecaster.standardize_output(forecast)
-            >>> # Now you can analyze by step
-            >>> step1_forecasts = standardized[standardized['step'] == 1]
+                - ds, yhat, yhat_lower, yhat_upper, step
         """
-        # Validate inputs
-        if 'ds' not in forecast.columns:
-            raise ValueError("forecast must have 'ds' column")
-
-        # Find all yhat columns
-        yhat_cols = [col for col in forecast.columns if col.startswith('yhat') and col[4:].isdigit()]
-        if not yhat_cols:
-            raise ValueError("No yhat columns found in forecast")
-
-        # Build results list - one row per step per forecast timestamp
-        results = []
-
-        for step in range(1, self.config.n_forecast + 1):
-            yhat_col = f'yhat{step}'
-
-            # If this yhat column doesn't exist, skip it
-            if yhat_col not in forecast.columns:
-                continue
-
-            # For each row in forecast, extract this step's forecast
-            for _, row in forecast.iterrows():
-                forecast_ts = row['ds']
-                yhat = row[yhat_col]
-
-                result_row = {
-                    'ds': forecast_ts,
-                    'step': step,
-                    'yhat': yhat,
-                }
-
-                # Add uncertainty bounds if available
-                # Check for quantile format (e.g., "yhat1 16.0%")
-                lower_col = f'{yhat_col} 16.0%'
-                upper_col = f'{yhat_col} 84.0%'
-
-                if lower_col in forecast.columns:
-                    result_row['yhat_lower'] = row[lower_col]
-                elif f'yhat_lower{step}' in forecast.columns:
-                    result_row['yhat_lower'] = row[f'yhat_lower{step}']
-
-                if upper_col in forecast.columns:
-                    result_row['yhat_upper'] = row[upper_col]
-                elif f'yhat_upper{step}' in forecast.columns:
-                    result_row['yhat_upper'] = row[f'yhat_upper{step}']
-
-                results.append(result_row)
-
-        # Convert results to dataframe
-        standardized = pd.DataFrame(results)
-
-        # Ensure proper column order
-        base_cols = ['ds', 'step', 'yhat']
-        optional_cols = ['yhat_lower', 'yhat_upper']
-        column_order = base_cols + [col for col in optional_cols if col in standardized.columns]
-        standardized = standardized[column_order]
-
-        return standardized
+        return OutputFormatter.standardize_neuralprophet_output(
+            forecast, self.config.freq, self.config.n_forecast
+        )
 
     def save(self, path: str | Path) -> None:
         """Save the fitted NeuralProphet model to disk.
@@ -721,29 +608,27 @@ class NeuralProphetForecaster(ValidationMixin):
             RuntimeError: If model hasn't been fitted yet
         """
         if self.model_ is None:
-            raise RuntimeError(
-                "Model has not been fitted yet. Call fit() before save()."
-            )
+            raise RuntimeError("Model has not been fitted yet. Call fit() before save().")
 
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
 
         # Save NeuralProphet model
-        save(self.model_, str(path / 'model.np'))
+        save(self.model_, str(path / "model.np"))
 
         # Save config
-        self.config.to_yaml(path / 'config.yaml')
+        self.config.to_yaml(path / "config.yaml")
 
         # Save metadata
         metadata = {
-            'regressor_cols': self._regressor_cols,
-            'training_window_size': self._training_window_size,
+            "regressor_cols": self._regressor_cols,
+            "training_window_size": self._training_window_size,
         }
-        with open(path / 'metadata.json', 'w') as f:
+        with open(path / "metadata.json", "w") as f:
             json.dump(metadata, f)
 
     @classmethod
-    def load(cls, path: str | Path) -> 'NeuralProphetForecaster':
+    def load(cls, path: str | Path) -> NeuralProphetForecaster:
         """Load a previously saved NeuralProphet model.
 
         Args:
@@ -758,7 +643,7 @@ class NeuralProphetForecaster(ValidationMixin):
         path = Path(path)
 
         # Load config
-        config_path = path / 'config.yaml'
+        config_path = path / "config.yaml"
         if not config_path.exists():
             raise FileNotFoundError(f"Config file not found: {config_path}")
         config = NeuralProphetConfig.from_yaml(config_path)
@@ -767,23 +652,23 @@ class NeuralProphetForecaster(ValidationMixin):
         forecaster = cls(config)
 
         # Load NeuralProphet model
-        model_path = path / 'model.np'
+        model_path = path / "model.np"
         if not model_path.exists():
             raise FileNotFoundError(f"Model file not found: {model_path}")
         forecaster.model_ = load(str(model_path))
 
         # Load metadata
-        metadata_path = path / 'metadata.json'
+        metadata_path = path / "metadata.json"
         if metadata_path.exists():
-            with open(metadata_path, 'r') as f:
+            with open(metadata_path) as f:
                 metadata = json.load(f)
-            forecaster._regressor_cols = metadata.get('regressor_cols', [])
-            forecaster._training_window_size = metadata.get('training_window_size')
+            forecaster._regressor_cols = metadata.get("regressor_cols", [])
+            forecaster._training_window_size = metadata.get("training_window_size")
 
         # Recreate decomposer if decomposition was used
         if config.use_decomposition:
             cfg = config.decomposer
-            if cfg.method == 'bandpass':
+            if cfg.method == "bandpass":
                 forecaster._decomposer = BandpassDecomposer(
                     freq=cfg.freq,
                     period_pairs=cfg.period_pairs,
@@ -797,7 +682,7 @@ class NeuralProphetForecaster(ValidationMixin):
                     verbose=cfg.verbose,
                     include_residual=cfg.include_residual,
                 )
-            elif cfg.method == 'vmd':
+            elif cfg.method == "vmd":
                 forecaster._decomposer = RubinVMDDecomposer(
                     freq=cfg.freq,
                     alpha=cfg.alpha,
@@ -812,10 +697,10 @@ class NeuralProphetForecaster(ValidationMixin):
     def plot(
         self,
         lead_time: float = 12.0,
-        axs: Optional[plt.axes] = None,
-        df_test: Optional[pd.DataFrame] = None,
+        axs: plt.axes | None = None,
+        df_test: pd.DataFrame | None = None,
         window_days: float | None = None,
-        title: Optional[str] = None,
+        title: str | None = None,
         # show_grid: bool = True,
     ) -> plt.Figure:
         """Plot fitted and actual values for a given lead time.
@@ -863,14 +748,10 @@ class NeuralProphetForecaster(ValidationMixin):
             >>> plt.show()
         """
         if self.model_ is None:
-            raise RuntimeError(
-                "Model has not been fitted yet. Call fit() before plot()."
-            )
+            raise RuntimeError("Model has not been fitted yet. Call fit() before plot().")
 
-        if not hasattr(self, '_fit_df'):
-            raise RuntimeError(
-                "Fitted data not available. Ensure fit() was called properly."
-            )
+        if not hasattr(self, "_fit_df"):
+            raise RuntimeError("Fitted data not available. Ensure fit() was called properly.")
 
         # Create or get figure
         if axs is None:
@@ -881,96 +762,98 @@ class NeuralProphetForecaster(ValidationMixin):
 
         # Get fitted values using clean API
         fitted_forecast = self.fitted()
-        fitted_forecast['ds'] = pd.to_datetime(fitted_forecast['ds'])
+        fitted_forecast["ds"] = pd.to_datetime(fitted_forecast["ds"])
 
         # Apply window filter to training data
         if window_days is not None:
-            cutoff = (self.latest_timestamp - pd.Timedelta(days=window_days)).tz_localize("America/Santiago")
-            fitted_forecast = fitted_forecast[fitted_forecast['ds'] >= cutoff]
+            cutoff = (self.latest_timestamp - pd.Timedelta(days=window_days)).tz_localize(
+                "America/Santiago"
+            )
+            fitted_forecast = fitted_forecast[fitted_forecast["ds"] >= cutoff]
 
         # Find the step number for the given lead_time
         step = _lead_time_to_step(lead_time, self.config.freq, self.config.n_forecast)
 
         # Get the yhat column name
-        yhat_col = f'yhat{step}'
+        yhat_col = f"yhat{step}"
         if yhat_col not in fitted_forecast.columns:
             raise ValueError(
                 f"Column '{yhat_col}' not found in forecast. "
                 f"Maximum step available: {self.config.n_forecast}"
             )
 
-        issue_time = fitted_forecast[['ds','y']].dropna()['ds'].max()
-        
+        issue_time = fitted_forecast[["ds", "y"]].dropna()["ds"].max()
+
         # Plot fitted data
         axs.plot(
-            fitted_forecast['ds'],
-            fitted_forecast['y'],
-            label='Training Actual',
-            color='black',
+            fitted_forecast["ds"],
+            fitted_forecast["y"],
+            label="Training Actual",
+            color="black",
             linewidth=2,
-            marker='o',
+            marker="o",
             markersize=3,
             alpha=0.7,
         )
 
-        mask_latest = fitted_forecast['ds'] <= issue_time
+        mask_latest = fitted_forecast["ds"] <= issue_time
 
         # Plot fitted forecast for the lead_time
         axs.plot(
-            fitted_forecast['ds'].loc[mask_latest],
+            fitted_forecast["ds"].loc[mask_latest],
             fitted_forecast[yhat_col].loc[mask_latest],
-            label=f'Trained model for ({lead_time})',
-            color='r',
+            label=f"Trained model for ({lead_time})",
+            color="r",
             linewidth=2,
-            linestyle='--',
-            marker='s',
+            linestyle="--",
+            marker="s",
             markersize=3,
             alpha=0.7,
         )
 
         # Plot fitted forecast for the lead_time
         axs.plot(
-            fitted_forecast['ds'].loc[~mask_latest],
+            fitted_forecast["ds"].loc[~mask_latest],
             fitted_forecast[yhat_col].loc[~mask_latest],
-            label=f'Fitted Forecast ({lead_time})',
-            color='blue',
+            label=f"Fitted Forecast ({lead_time})",
+            color="blue",
             linewidth=2,
-            linestyle='--',
-            marker='s',
+            linestyle="--",
+            marker="s",
             markersize=3,
             alpha=0.7,
         )
 
         # plot the issue time
-        axs.axvline(issue_time, color='grey', ls='--')
+        axs.axvline(issue_time, color="grey", ls="--")
 
         # If test data provided, overlay it
         if df_test is not None:
             # Plot test actual values
             axs.plot(
-                df_test['ds'],
-                df_test['y'],
-                label='Test Actual',
-                color='g',
+                df_test["ds"],
+                df_test["y"],
+                label="Test Actual",
+                color="g",
                 linewidth=2,
-                marker='o',
+                marker="o",
                 markersize=3,
                 alpha=0.7,
             )
 
         # Format plot
-        axs.set_xlabel('Local Time', fontsize=12, fontweight='bold')
-        axs.set_ylabel(r'Temperature [$^\circ$ C]', fontsize=12, fontweight='bold')
+        axs.set_xlabel("Local Time", fontsize=12, fontweight="bold")
+        axs.set_ylabel(r"Temperature [$^\circ$ C]", fontsize=12, fontweight="bold")
 
         if title is None:
             if df_test is not None:
-                title = f'NeuralProphet Forecast: Training vs Test ({lead_time} lead time)'
+                title = f"NeuralProphet Forecast: Training vs Test ({lead_time} lead time)"
             else:
-                title = f'NeuralProphet Fitted Forecast ({lead_time} lead time)'
+                title = f"NeuralProphet Fitted Forecast ({lead_time} lead time)"
 
-        axs.set_title(title, fontsize=14, fontweight='bold', pad=20)
+        axs.set_title(title, fontsize=14, fontweight="bold", pad=20)
 
-        axs.legend(loc='best', fontsize=10, framealpha=0.95)
+        axs.legend(loc="best", fontsize=10, framealpha=0.95)
         axs.grid(True, alpha=0.3)
         plt.tight_layout()
 
@@ -1010,7 +893,7 @@ def prepare_df(
         df = _add_time_features(df)
 
     # Prepare data - keep only relevant columns
-    cols_to_keep = ['ds', 'y'] + regressor_cols
+    cols_to_keep = ["ds", "y"] + regressor_cols
     df_model = df[[c for c in cols_to_keep if c in df.columns]].copy()
 
     # Ensure regular frequency
@@ -1018,7 +901,7 @@ def prepare_df(
 
     # Handle missing values
     if config.impute_missing:
-        df_model = df_model.interpolate(method='linear')
+        df_model = df_model.interpolate(method="linear")
 
     return df_model
 
@@ -1037,14 +920,14 @@ def _add_time_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     # Hour of day (0-23) -> cyclic encoding
-    hour = df['ds'].dt.hour + df['ds'].dt.minute / 60.0
-    df['hour_sin'] = np.sin(2 * np.pi * hour / 24.0)
-    df['hour_cos'] = np.cos(2 * np.pi * hour / 24.0)
+    hour = df["ds"].dt.hour + df["ds"].dt.minute / 60.0
+    df["hour_sin"] = np.sin(2 * np.pi * hour / 24.0)
+    df["hour_cos"] = np.cos(2 * np.pi * hour / 24.0)
 
     # Day of year (1-366) -> cyclic encoding
-    doy = df['ds'].dt.dayofyear
-    df['doy_sin'] = np.sin(2 * np.pi * doy / 365.25)
-    df['doy_cos'] = np.cos(2 * np.pi * doy / 365.25)
+    doy = df["ds"].dt.dayofyear
+    df["doy_sin"] = np.sin(2 * np.pi * doy / 365.25)
+    df["doy_cos"] = np.cos(2 * np.pi * doy / 365.25)
 
     return df
 
@@ -1070,20 +953,20 @@ def extend_with_nans(
         Extended dataframe with NaN values for future rows
     """
     df = df.copy()
-    last_date = df['ds'].max()
+    last_date = df["ds"].max()
 
     # Generate future dates
-    future_dates = pd.date_range(
-        start=last_date,
-        periods=periods + 1,
-        freq=freq
-    )[1:]  # Skip the last training date
+    future_dates = pd.date_range(start=last_date, periods=periods + 1, freq=freq)[
+        1:
+    ]  # Skip the last training date
 
     # Create rows with NaNs for future periods
-    future_rows = pd.DataFrame({
-        'ds': future_dates,
-        'y': np.nan,
-    })
+    future_rows = pd.DataFrame(
+        {
+            "ds": future_dates,
+            "y": np.nan,
+        }
+    )
 
     # Add NaN columns for regressors
     for col in regressor_cols:

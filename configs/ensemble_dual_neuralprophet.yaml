@@ -1,0 +1,90 @@
+# Dual NeuralProphet Ensemble
+# Same setup as Prophet: no lagged regressors, same bands, same seasonalities
+#
+# High-freq component: sub-daily + daily patterns
+# Low-freq component: weekly + bi-weekly + monthly patterns (downsampled to 4h)
+
+name: ensemble
+lag_days: 60
+n_forecast: 48
+freq: 15min
+
+# 5-band decomposition (freq as observations per day: 96 = 24 hours / 15min)
+decomposer:
+  method: bandpass
+  freq: 96
+  verbose: false
+  period_pairs:
+    - [0.10, 0.70]   # Band 0: Sub-daily (< 17h)
+    - [0.70, 1.50]   # Band 1: Daily (17h - 4d)
+    - [1.50, 7.00]   # Band 2: Weekly (4-11d)
+    - [7.00, 25.00]  # Band 3: Bi-weekly (11-25d)
+    - [25.00, 60.00] # Band 4: Monthly (25-60d)
+  filter_type: savgol
+  savgol_polyorder: 3
+  savgol_butter_cleanup: false
+  edge_method: reflect
+  edge_pad_periods: 2.0
+  include_residual: false
+  nan_fill: periodic
+  nan_fill_period: 1.0
+
+# Component models
+components:
+  - name: high_freq
+    model_type: neural_prophet
+    band_indices: [0, 1]
+    resolution: 15min
+    lag_days: 7
+    seasonalities:
+      - name: sub_daily
+        period: 0.5       # days
+        fourier_order: 10
+      - name: daily
+        period: 1.0       # days
+        fourier_order: 13
+    use_lagged_regressors: false
+    ar_layers: []
+    ar_reg: 1.0
+    # High-freq: few trend points
+    n_changepoints: 5
+    growth: flat
+    epochs: 20
+    learning_rate: 0.1
+
+  - name: low_freq
+    model_type: neural_prophet
+    band_indices: [2, 3, 4]
+    resolution: 15min
+    downsample_to: 6h
+    # lag_days inherited from ensemble lag_days (60)
+    seasonalities:
+      - name: weekly
+        period: 7.0
+        fourier_order: 12
+      - name: bi_weekly
+        period: 14.0
+        fourier_order: 10
+      - name: monthly
+        period: 30.0
+        fourier_order: 10
+
+    use_lagged_regressors: true
+    ar_layers: []
+    ar_reg: 1.0
+    # Low-freq: more changepoints
+    n_changepoints: 24
+    growth: linear
+    epochs: 500
+    learning_rate: 0.005
+
+# Combination method: sum
+combine_method: sum
+
+# Post-processing (skip bias for NeuralProphet)
+post_processor:
+  bias_correction: true
+  bias_for_neural_prophet: true
+  ets_blend: false
+
+output_freq: 15min

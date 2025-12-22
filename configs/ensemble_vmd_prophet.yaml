@@ -1,0 +1,77 @@
+# VMD Ensemble with Prophet
+# Uses RubinVMD decomposition instead of bandpass filtering
+# VMD (Variational Mode Decomposition) is adaptive and data-driven
+#
+# VMD produces modes (IMFs) rather than fixed frequency bands:
+# - y_subdaily: Sub-daily variations
+# - y_vmd_daily: Daily cycle
+# - y_vmd_weekly: Weekly cycle
+# - y_vmd_monthly: Monthly cycle
+# - y_vmd_trend: Long-term trend
+
+name: ensemble
+lag_days: 60
+n_forecast: 96
+freq: 15min
+
+# VMD decomposition
+decomposer:
+  method: vmd
+  freq: 96
+  verbose: false
+  # VMD parameters
+  alpha: 2000           # Bandwidth constraint (higher = narrower bands)
+  K_stage1: 5           # Number of modes in stage 1
+  K_stage2: 3           # Number of modes in stage 2
+
+# Component models
+# Note: VMD produces different column names (y_subdaily, y_vmd_daily, etc.)
+# The band_indices here refer to the order of modes produced
+components:
+  - name: high_freq
+    model_type: prophet
+    band_indices: [0, 1]    # subdaily + daily modes
+    resolution: 15min
+    lag_days: 7
+    seasonalities:
+      - name: sub_daily
+        period: 0.5
+        fourier_order: 10
+      - name: daily
+        period: 1.0
+        fourier_order: 13
+    # High-freq: no trend
+    n_changepoints: 0
+    changepoint_prior_scale: 0.05
+    growth: flat
+
+  - name: low_freq
+    model_type: prophet
+    band_indices: [2, 3, 4]  # weekly + monthly + trend modes
+    resolution: 15min
+    downsample_to: 4h
+    lag_days: 60
+    seasonalities:
+      - name: weekly
+        period: 7.0
+        fourier_order: 8
+      - name: bi_weekly
+        period: 14.0
+        fourier_order: 5
+    # Low-freq: more changepoints
+    n_changepoints: 28
+    changepoint_prior_scale: 0.01
+    growth: linear
+
+# Combination method: sum with bias correction
+combine_method: sum
+
+# Post-processing with robust bias correction
+post_processor:
+  bias_correction: true
+  bias_window_hours: 6.0
+  bias_method: median
+  bias_for_neural_prophet: false
+  ets_blend: false
+
+output_freq: 15min

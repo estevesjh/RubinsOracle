@@ -16,8 +16,7 @@ from prophet.serialize import model_from_json, model_to_json
 
 from rubin_oracle.base import ValidationMixin
 from rubin_oracle.config import ProphetConfig
-# preprocess_for_forecast not needed for Prophet - uses Fourier terms instead
-from rubin_oracle.utils import validate_input
+from rubin_oracle.utils import FrequencyConverter, OutputFormatter, validate_input
 
 
 class ProphetForecaster(ValidationMixin):
@@ -74,9 +73,9 @@ class ProphetForecaster(ValidationMixin):
 
         # Limit to lag_days window unless train_on_all_history is set
         # (train_on_all_history is used by EnsembleForecaster for components)
-        if not getattr(self.config, 'train_on_all_history', False):
-            backward = (pd.Timedelta(f"{self.config.lag_days} days") + pd.Timedelta("1hour"))
-            df = df[df['ds'] >= (df['ds'].max() - backward)]
+        if not getattr(self.config, "train_on_all_history", False):
+            backward = pd.Timedelta(f"{self.config.lag_days} days") + pd.Timedelta("1hour")
+            df = df[df["ds"] >= (df["ds"].max() - backward)]
 
         # Apply date filtering if specified (Prophet doesn't use decomposition)
         # if self.config.train_start_date is not None:
@@ -86,8 +85,8 @@ class ProphetForecaster(ValidationMixin):
 
         # Prophet doesn't support timezone-aware timestamps - remove timezone
         df = df.copy()
-        if df['ds'].dt.tz is not None:
-            df['ds'] = df['ds'].dt.tz_localize(None)
+        if df["ds"].dt.tz is not None:
+            df["ds"] = df["ds"].dt.tz_localize(None)
 
         # Store training data for predict() when df is not provided
         self._fit_df = df.copy()
@@ -111,9 +110,9 @@ class ProphetForecaster(ValidationMixin):
         if self.config.custom_seasonalities:
             for season in self.config.custom_seasonalities:
                 self.model_.add_seasonality(
-                    name=season['name'],
-                    period=season['period'],
-                    fourier_order=season.get('fourier_order', 3),
+                    name=season["name"],
+                    period=season["period"],
+                    fourier_order=season.get("fourier_order", 3),
                     mode=self.config.seasonality_mode,
                 )
 
@@ -134,29 +133,46 @@ class ProphetForecaster(ValidationMixin):
         if self.model_ is None:
             return
 
+        # Prophet doesn't support timezone-aware timestamps - remove timezone if present
+        df = df.copy()
+        if df["ds"].dt.tz is not None:
+            df["ds"] = df["ds"].dt.tz_localize(None)
+
         # Get in-sample predictions (fitted values)
         fitted = self.model_.predict(df)
-        y_true = df['y'].values
-        y_pred = fitted['yhat'].values
+        y_true = df["y"].values
+        y_pred = fitted["yhat"].values
 
         # Compute metrics
         residuals = y_true - y_pred
         n = len(y_true)
 
-        rmse = np.sqrt(np.mean(residuals ** 2))
+        rmse = np.sqrt(np.mean(residuals**2))
         mae = np.mean(np.abs(residuals))
 
         # R² (coefficient of determination)
-        ss_res = np.sum(residuals ** 2)
-        ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+        ss_res: float = float(np.sum(residuals**2))
+        ss_tot: float = float(np.sum((y_true - np.mean(y_true)) ** 2))
         r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
 
         self.metrics_ = {
-            'rmse': rmse,
-            'mae': mae,
-            'r2': r2,
-            'n_samples': n,
+            "rmse": rmse,
+            "mae": mae,
+            "r2": r2,
+            "n_samples": n,
         }
+
+    def compute_metrics(self, df: pd.DataFrame) -> dict | None:
+        """Compute and return forecast metrics for the given data.
+
+        Args:
+            df: Data with 'ds' and 'y' columns
+
+        Returns:
+            Dictionary with metrics (rmse, mae, r2, n_samples) or None if computation fails
+        """
+        self._compute_metrics(df)
+        return self.metrics_
 
     def fitted(self) -> pd.DataFrame:
         """Get in-sample fitted values on training data.
@@ -180,15 +196,15 @@ class ProphetForecaster(ValidationMixin):
 
         # Prophet requires timezone-naive timestamps
         df = self._fit_df.copy()
-        if df['ds'].dt.tz is not None:
-            df['ds'] = df['ds'].dt.tz_localize(None)
+        if df["ds"].dt.tz is not None:
+            df["ds"] = df["ds"].dt.tz_localize(None)
 
         # Get fitted values
         forecast = self.model_.predict(df)
-        result = forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].copy()
+        result = forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]].copy()
 
         # Add actual values
-        result = result.merge(df[['ds', 'y']], on='ds', how='left')
+        result = result.merge(df[["ds", "y"]], on="ds", how="left")
 
         return result
 
@@ -214,13 +230,16 @@ class ProphetForecaster(ValidationMixin):
         if periods is None:
             periods = self.config.n_forecast
 
+        # Convert periods from days to samples based on frequency
+        periods_samples = FrequencyConverter.days_to_samples(periods, self.config.freq)
+
         # Create future dataframe and predict
-        future = self.model_.make_future_dataframe(periods=periods, freq=self.config.freq)
+        future = self.model_.make_future_dataframe(periods=periods_samples, freq=self.config.freq)
         forecast = self.model_.predict(future)
-        forecast = forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']]
+        forecast = forecast[["ds", "yhat", "yhat_lower", "yhat_upper"]]
 
         # Return only future periods
-        return forecast.tail(periods).reset_index(drop=True)
+        return forecast.tail(periods_samples).reset_index(drop=True)
 
     def predict(
         self,
@@ -253,15 +272,7 @@ class ProphetForecaster(ValidationMixin):
             >>> standardized['step'].tolist()
             [1, 2, 3]
         """
-        df = df.copy()
-
-        # Add step column (1-indexed forecast horizon)
-        df['step'] = range(1, len(df) + 1)
-
-        # Ensure column order
-        df = df[['ds', 'yhat', 'yhat_lower', 'yhat_upper', 'step']]
-
-        return df
+        return OutputFormatter.standardize_prophet_output(df, self.config.freq)
 
     def _fit_and_predict(
         self,
@@ -292,24 +303,24 @@ class ProphetForecaster(ValidationMixin):
         n_steps = len(forecast)
 
         # Initialize result with ds column
-        df_result = pd.DataFrame({'ds': forecast['ds'].values})
+        df_result = pd.DataFrame({"ds": forecast["ds"].values})
 
         # Initialize all yhat columns with NaN
         for step in range(1, n_steps + 1):
-            df_result[f'yhat{step}'] = pd.NA
-            df_result[f'yhat_lower{step}'] = pd.NA
-            df_result[f'yhat_upper{step}'] = pd.NA
+            df_result[f"yhat{step}"] = pd.NA
+            df_result[f"yhat_lower{step}"] = pd.NA
+            df_result[f"yhat_upper{step}"] = pd.NA
 
         # Fill in the diagonal - row i gets yhat{i+1}
         for i in range(n_steps):
             step = i + 1
-            df_result.loc[i, f'yhat{step}'] = forecast.iloc[i]['yhat']
-            df_result.loc[i, f'yhat_lower{step}'] = forecast.iloc[i]['yhat_lower']
-            df_result.loc[i, f'yhat_upper{step}'] = forecast.iloc[i]['yhat_upper']
+            df_result.loc[i, f"yhat{step}"] = forecast.iloc[i]["yhat"]
+            df_result.loc[i, f"yhat_lower{step}"] = forecast.iloc[i]["yhat_lower"]
+            df_result.loc[i, f"yhat_upper{step}"] = forecast.iloc[i]["yhat_upper"]
 
         # Add timezone back for compatibility with validation merge
-        if df_result['ds'].dt.tz is None:
-            df_result['ds'] = df_result['ds'].dt.tz_localize('America/Santiago')
+        if df_result["ds"].dt.tz is None:
+            df_result["ds"] = df_result["ds"].dt.tz_localize("America/Santiago")
 
         return df_result
 
@@ -325,20 +336,18 @@ class ProphetForecaster(ValidationMixin):
             RuntimeError: If model hasn't been fitted yet
         """
         if self.model_ is None:
-            raise RuntimeError(
-                "Model has not been fitted yet. Call fit() before save()."
-            )
+            raise RuntimeError("Model has not been fitted yet. Call fit() before save().")
 
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
 
         # Save Prophet model
-        model_path = path / 'model.json'
-        with open(model_path, 'w') as f:
+        model_path = path / "model.json"
+        with open(model_path, "w") as f:
             json.dump(model_to_json(self.model_), f)
 
         # Save config
-        config_path = path / 'config.yaml'
+        config_path = path / "config.yaml"
         self.config.to_yaml(config_path)
 
     @classmethod
@@ -357,7 +366,7 @@ class ProphetForecaster(ValidationMixin):
         path = Path(path)
 
         # Load config
-        config_path = path / 'config.yaml'
+        config_path = path / "config.yaml"
         if not config_path.exists():
             raise FileNotFoundError(f"Config file not found: {config_path}")
         config = ProphetConfig.from_yaml(config_path)
@@ -366,11 +375,11 @@ class ProphetForecaster(ValidationMixin):
         forecaster = cls(config)
 
         # Load Prophet model
-        model_path = path / 'model.json'
+        model_path = path / "model.json"
         if not model_path.exists():
             raise FileNotFoundError(f"Model file not found: {model_path}")
 
-        with open(model_path, 'r') as f:
+        with open(model_path) as f:
             model_json = json.load(f)
             forecaster.model_ = model_from_json(model_json)
 
@@ -409,23 +418,27 @@ class ProphetForecaster(ValidationMixin):
 
         try:
             import matplotlib.pyplot as plt
-        except ImportError:
-            raise ImportError("matplotlib is required for plotting. Install with: pip install matplotlib")
+        except ImportError as err:
+            raise ImportError(
+                "matplotlib is required for plotting. Install with: pip install matplotlib"
+            ) from err
 
         # Get fitted values using clean API
         fit_merged = self.fitted()
-        fit_merged['ds'] = pd.to_datetime(fit_merged['ds'])
-        fit_merged['residual'] = fit_merged['y'] - fit_merged['yhat']
+        fit_merged["ds"] = pd.to_datetime(fit_merged["ds"])
+        fit_merged["residual"] = fit_merged["y"] - fit_merged["yhat"]
 
         # Apply window filter
         if window_days is not None:
-            cutoff = fit_merged['ds'].max() - pd.Timedelta(days=window_days)
-            fit_merged = fit_merged[fit_merged['ds'] >= cutoff]
+            cutoff = fit_merged["ds"].max() - pd.Timedelta(days=window_days)
+            fit_merged = fit_merged[fit_merged["ds"] >= cutoff]
 
         # Create figure
         if ax is None:
             if show_residuals:
-                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize, height_ratios=[3, 1], sharex=True)
+                fig, (ax1, ax2) = plt.subplots(
+                    2, 1, figsize=figsize, height_ratios=[3, 1], sharex=True
+                )
             else:
                 fig, ax1 = plt.subplots(figsize=figsize)
                 ax2 = None
@@ -435,11 +448,15 @@ class ProphetForecaster(ValidationMixin):
             fig = ax.get_figure()
 
         # Plot training data and fitted model
-        ax1.plot(fit_merged['ds'], fit_merged['y'], 'k-', lw=1, alpha=0.8, label='Data')
-        ax1.plot(fit_merged['ds'], fit_merged['yhat'], 'r-', lw=1, alpha=0.8, label='Fitted model')
+        ax1.plot(fit_merged["ds"], fit_merged["y"], "k-", lw=1, alpha=0.8, label="Data")
+        ax1.plot(fit_merged["ds"], fit_merged["yhat"], "r-", lw=1, alpha=0.8, label="Fitted model")
         ax1.fill_between(
-            fit_merged['ds'], fit_merged['yhat_lower'], fit_merged['yhat_upper'],
-            color='red', alpha=0.1, label='Uncertainty'
+            fit_merged["ds"],
+            fit_merged["yhat_lower"],
+            fit_merged["yhat_upper"],
+            color="red",
+            alpha=0.1,
+            label="Uncertainty",
         )
 
         # Generate forecast using clean API
@@ -447,37 +464,40 @@ class ProphetForecaster(ValidationMixin):
             forecast_df = self.forecast()
 
         forecast_df = forecast_df.copy()
-        forecast_df['ds'] = pd.to_datetime(forecast_df['ds'])
+        forecast_df["ds"] = pd.to_datetime(forecast_df["ds"])
 
         # Mark forecast start
-        forecast_start = forecast_df['ds'].iloc[0]
-        ax1.axvline(forecast_start, color='gray', linestyle='--', alpha=0.5, label='Forecast start')
+        forecast_start = forecast_df["ds"].iloc[0]
+        ax1.axvline(forecast_start, color="gray", linestyle="--", alpha=0.5, label="Forecast Time")
 
         # Plot forecast
-        ax1.plot(forecast_df['ds'], forecast_df['yhat'], 'b-', lw=2, label='Forecast')
-        if 'yhat_lower' in forecast_df.columns and 'yhat_upper' in forecast_df.columns:
+        ax1.plot(forecast_df["ds"], forecast_df["yhat"], "b-", lw=2, label="Forecast")
+        if "yhat_lower" in forecast_df.columns and "yhat_upper" in forecast_df.columns:
             ax1.fill_between(
-                forecast_df['ds'], forecast_df['yhat_lower'], forecast_df['yhat_upper'],
-                color='blue', alpha=0.1
+                forecast_df["ds"],
+                forecast_df["yhat_lower"],
+                forecast_df["yhat_upper"],
+                color="blue",
+                alpha=0.1,
             )
 
         # Overlay test data if provided
         if df_test is not None:
             df_test_plot = df_test.copy()
-            df_test_plot['ds'] = pd.to_datetime(df_test_plot['ds'])
-            ax1.plot(df_test_plot['ds'], df_test_plot['y'], 'g-', lw=2, alpha=0.8, label='Actual')
+            df_test_plot["ds"] = pd.to_datetime(df_test_plot["ds"])
+            ax1.plot(df_test_plot["ds"], df_test_plot["y"], "g-", lw=2, alpha=0.8, label="Actual")
 
-        ax1.set_ylabel('Value')
-        ax1.set_title(title or f'{self.name} - Fit and Forecast')
-        ax1.legend(loc='best')
+        ax1.set_ylabel("Value")
+        ax1.set_title(title or f"{self.name} - Fit and Forecast")
+        ax1.legend(loc="best")
         ax1.grid(True, alpha=0.3)
 
         # Plot residuals if requested
         if show_residuals and ax2 is not None:
-            ax2.plot(fit_merged['ds'], fit_merged['residual'], 'g-', lw=0.5, alpha=0.8)
-            ax2.axhline(0, color='k', linestyle='-', alpha=0.3)
-            ax2.set_xlabel('Date')
-            ax2.set_ylabel('Residual')
+            ax2.plot(fit_merged["ds"], fit_merged["residual"], "g-", lw=0.5, alpha=0.8)
+            ax2.axhline(0, color="k", linestyle="-", alpha=0.3)
+            ax2.set_xlabel("Date")
+            ax2.set_ylabel("Residual")
             ax2.grid(True, alpha=0.3)
 
         if ax is None:

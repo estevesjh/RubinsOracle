@@ -1,0 +1,90 @@
+# NeuralProphet Ensemble with Lagged Regressors
+# High-freq and low-freq components use OTHER bands as lagged regressors
+# This allows cross-frequency information to inform predictions
+#
+# The decomposed bands are passed as lagged regressors:
+# - high_freq model sees low_freq bands as additional features
+# - low_freq model sees high_freq bands as additional features
+
+name: ensemble
+lag_days: 60
+n_forecast: 96
+freq: 15min
+
+# 5-band decomposition
+decomposer:
+  method: bandpass
+  freq: 96
+  verbose: false
+  period_pairs:
+    - [0.10, 0.70]    # Band 0: Sub-daily (< 17h)
+    - [0.70, 4.00]    # Band 1: Daily (17h - 4d)
+    - [4.00, 11.00]   # Band 2: Weekly (4-11d)
+    - [11.00, 25.00]  # Band 3: Bi-weekly (11-25d)
+    - [25.00, 60.00]  # Band 4: Monthly (25-60d)
+  filter_type: savgol
+  savgol_polyorder: 3
+  savgol_butter_cleanup: false
+  edge_method: reflect
+  edge_pad_periods: 2.0
+  include_residual: false
+  nan_fill: periodic
+  nan_fill_period: 1.0
+
+# Component models with lagged regressors
+components:
+  - name: high_freq
+    model_type: neural_prophet
+    band_indices: [0, 1]
+    resolution: 15min
+    lag_days: 7
+    seasonalities:
+      - name: sub_daily
+        period: 0.5
+        fourier_order: 10
+      - name: daily
+        period: 1.0
+        fourier_order: 13
+    # Use low-freq bands as lagged regressors
+    use_lagged_regressors: true
+    ar_layers: [32, 16]
+    ar_reg: 0.5
+    # No trend for high-freq
+    n_changepoints: 0
+    growth: flat
+    epochs: 20
+    learning_rate: 0.005
+
+  - name: low_freq
+    model_type: neural_prophet
+    band_indices: [2, 3, 4]
+    resolution: 15min
+    downsample_to: 4h
+    lag_days: 60
+    seasonalities:
+      - name: weekly
+        period: 7.0
+        fourier_order: 8
+      - name: bi_weekly
+        period: 14.0
+        fourier_order: 5
+    # Use high-freq bands as lagged regressors
+    use_lagged_regressors: true
+    ar_layers: [32, 16]
+    ar_reg: 0.5
+    # More changepoints for low-freq
+    n_changepoints: 28
+    growth: linear
+    epochs: 20
+    learning_rate: 0.005
+
+# Combination method: sum (NP handles bias via AR)
+combine_method: sum
+
+# Post-processing (minimal for NeuralProphet)
+post_processor:
+  bias_correction: false
+  bias_for_neural_prophet: false
+  ets_blend: false
+
+output_freq: 15min

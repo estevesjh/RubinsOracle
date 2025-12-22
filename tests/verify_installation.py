@@ -1,5 +1,7 @@
 """Quick verification script to test package installation and imports."""
 
+from __future__ import annotations
+
 import sys
 
 
@@ -7,13 +9,14 @@ def test_basic_imports():
     """Test basic package imports."""
     print("Testing basic imports...")
     try:
-        from rubin_oracle import (
-            Forecaster,
+        from rubin_oracle import (  # noqa: F401
             BaseForecasterConfig,
-            ProphetConfig,
+            Forecaster,
             NeuralProphetConfig,
+            ProphetConfig,
             ProphetForecaster,
         )
+
         print("✓ Basic imports successful")
         return True
     except ImportError as e:
@@ -25,8 +28,9 @@ def test_prophet_import():
     """Test Prophet-specific imports."""
     print("\nTesting Prophet imports...")
     try:
-        from rubin_oracle import ProphetForecaster
-        from rubin_oracle.config import ProphetConfig
+        from rubin_oracle import ProphetForecaster  # noqa: F401
+        from rubin_oracle.config import ProphetConfig  # noqa: F401
+
         print("✓ Prophet imports successful")
         return True
     except ImportError as e:
@@ -38,8 +42,9 @@ def test_neural_prophet_import():
     """Test NeuralProphet-specific imports."""
     print("\nTesting NeuralProphet imports...")
     try:
-        from rubin_oracle import NeuralProphetForecaster
-        from rubin_oracle.config import NeuralProphetConfig
+        from rubin_oracle import NeuralProphetForecaster  # noqa: F401
+        from rubin_oracle.config import NeuralProphetConfig  # noqa: F401
+
         print("✓ NeuralProphet imports successful")
         return True
     except ImportError as e:
@@ -51,7 +56,7 @@ def test_config_creation():
     """Test configuration creation."""
     print("\nTesting configuration creation...")
     try:
-        from rubin_oracle.config import ProphetConfig, NeuralProphetConfig
+        from rubin_oracle.config import NeuralProphetConfig, ProphetConfig
 
         # Test ProphetConfig
         prophet_config = ProphetConfig(
@@ -80,7 +85,8 @@ def test_yaml_configs():
     print("\nTesting YAML config loading...")
     try:
         from pathlib import Path
-        from rubin_oracle.config import ProphetConfig, NeuralProphetConfig
+
+        from rubin_oracle.config import NeuralProphetConfig, ProphetConfig
 
         # Test Prophet YAML
         prophet_yaml = Path("rubin_oracle/configs/prophet_default.yaml")
@@ -108,22 +114,25 @@ def test_data_utils():
     """Test data utilities."""
     print("\nTesting data utilities...")
     try:
-        import pandas as pd
         import numpy as np
-        from rubin_oracle.utils import validate_input, prepare_regular_frequency
+        import pandas as pd
+
+        from rubin_oracle.utils import prepare_regular_frequency, validate_input
 
         # Create sample data
-        df = pd.DataFrame({
-            'ds': pd.date_range('2024-01-01', periods=100, freq='h'),
-            'y': np.random.randn(100),
-        })
+        df = pd.DataFrame(
+            {
+                "ds": pd.date_range("2024-01-01", periods=100, freq="h"),
+                "y": np.random.randn(100),
+            }
+        )
 
         # Test validation
         validated = validate_input(df)
         print(f"✓ Data validation successful: {len(validated)} rows")
 
         # Test frequency preparation
-        regular = prepare_regular_frequency(df, freq='h')
+        regular = prepare_regular_frequency(df, freq="h")
         print(f"✓ Frequency preparation successful: {len(regular)} rows")
 
         return True
