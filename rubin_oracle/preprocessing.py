@@ -16,15 +16,17 @@ Functions:
 """
 
 import warnings
-from typing import Optional, Literal, List, Tuple
+from typing import Literal, Optional
+
 import numpy as np
 import pandas as pd
-from scipy.signal import savgol_filter, butter, filtfilt, sosfiltfilt
-
+from scipy.signal import butter, savgol_filter, sosfiltfilt
+from statsmodels.tsa.seasonal import STL
 
 # =============================================================================
 # Periodic NaN Fill Functions
 # =============================================================================
+
 
 def fill_nan_periodic(
     y: np.ndarray | pd.Series,
@@ -92,7 +94,8 @@ def fill_nan_periodic(
         if gap_length > max_gap:
             warnings.warn(
                 f"Gap at index {gap_start}-{gap_end} ({gap_length} points) "
-                f"exceeds max_gap_periods={max_gap_periods}. Skipping."
+                f"exceeds max_gap_periods={max_gap_periods}. Skipping.",
+                stacklevel=2,
             )
             continue
 
@@ -124,7 +127,7 @@ def fill_nan_periodic(
     remaining_nan = np.isnan(y)
     if remaining_nan.any():
         y_series = pd.Series(y)
-        y = y_series.interpolate(method='linear').ffill().bfill().values
+        y = y_series.interpolate(method="linear").ffill().bfill().values
 
     if verbose:
         print(f"Filled {filled_count} NaN values using periodic fill (period={period_days}d)")
@@ -136,144 +139,137 @@ def fill_nan_periodic(
 # Bandpass Decomposer
 # =============================================================================
 
+"""
+BandpassDecomposer with unified padding methods for edge correction.
+
+Supports multiple padding strategies:
+- constant: Pad with edge values (default)
+- reflect: Mirror reflection at edges
+- symmetric: Symmetric reflection at edges
+- periodic: Copy from ±1 period away (preserves local amplitude)
+- stl: STL decomposition extrapolation (good for stationary signals)
+- arima: ARIMA forecasting (captures local dynamics)
+
+Usage:
+    decomposer = BandpassDecomposer(
+        freq=96,
+        period_pairs=[(0.4, 0.6), (0.75, 1.5), (1.5, 2.5), (2.5, 14.)],
+        filter_type='butterworth',
+        pad_method='arima',         # 'constant', 'periodic', 'stl', 'arima'
+        pad_num_periods=1,          # Number of periods to replace at each edge
+        pad_max_periods=2.0,        # Max pad size in periods (caps low-freq bands)
+    )
+    df_decomposed = decomposer.decompose(df)
+"""
+
+
 class BandpassDecomposer:
     """Decomposes time series into bandpass-filtered frequency components.
 
-    Uses pairs of periods to create bandpass filters that isolate specific
-    frequency bands. Supports Savitzky-Golay and Butterworth filtering with
-    edge effect mitigation for forecasting applications.
-
-    Key features:
-        - Period pairs for direct bandpass filtering (not lowpass cascade)
-        - Periodic NaN fill (preserves daily cycle structure)
-        - Edge effect mitigation (reflect padding, extrapolate, etc.)
-        - Edge weighting for forecasting (trust recent data more)
-        - Optional Butterworth cleanup after Savitzky-Golay
-        - Signal reconstruction from components
-
-    Attributes:
-        freq: Data frequency in observations per day
-        period_pairs: List of (low, high) period pairs in days
-        filter_type: Type of filter ('savgol' or 'butterworth')
-        edge_method: Padding method for edge effect mitigation
-
-    Example:
-        >>> decomposer = BandpassDecomposer(
-        ...     freq=96,
-        ...     period_pairs=[(0.5, 1), (1, 7), (7, 28)],
-        ...     filter_type='butterworth',
-        ...     edge_method='reflect',
-        ...     edge_pad_periods=2.0
-        ... )
-        >>> df_decomposed = decomposer.decompose(df)
-        >>> reconstructed = decomposer.reconstruct(df_decomposed)
+    Supports multiple padding methods for edge effect mitigation:
+    - Pre-filter padding: constant, reflect, symmetric, extrapolate
+    - Post-filter edge correction: periodic, stl, arima
     """
 
     def __init__(
         self,
         freq: int = 96,
-        period_pairs: Optional[List[Tuple[float, float]]] = None,
-        filter_type: Literal['savgol', 'butterworth'] = 'butterworth',
-        mode: Literal['drop', 'keep'] = 'keep',
+        period_pairs: Optional[list[tuple[float, float]]] = None,
+        filter_type: Literal["savgol", "butterworth"] = "savgol",
+        mode: Literal["drop", "keep"] = "keep",
         # NaN handling
-        nan_fill: Literal['periodic', 'linear', 'ffill'] = 'periodic',
+        nan_fill: Literal["periodic", "linear", "ffill"] = "periodic",
         nan_fill_period: float = 1.0,
         nan_fill_max_gap: int = 7,
-        # Edge effect mitigation
-        edge_method: Literal['none', 'reflect', 'symmetric', 'constant', 'extrapolate'] = 'reflect',
-        edge_pad_periods: float = 2.0,
-        # Edge weighting (for forecasting - trust recent data more)
-        use_edge_weighting: bool = False,
-        edge_weight_decay: float = 0.1,
-        # Savitzky-Golay specific parameters
+        # Pre-filter edge padding (scipy filtfilt)
+        edge_method: Literal[
+            "none", "reflect", "symmetric", "constant", "extrapolate"
+        ] = "constant",
+        edge_pad_periods: float = 4.0,
+        # Post-filter edge correction (pad_*)
+        pad_method: Literal["none", "periodic", "stl", "arima"] = "none",
+        pad_num_periods: int = 1,
+        pad_max_periods: float = 2.0,
+        pad_target_periods: Optional[dict] = None,  # {band_idx: period_obs} for exact periods
+        pad_arima_order: tuple[int, int, int] = (2, 0, 2),
+        pad_bands: Optional[list[int]] = None,  # Which bands to apply padding to (None = all)
+        # Savitzky-Golay parameters
         savgol_polyorder: int = 3,
-        savgol_butter_cleanup: bool = True,
-        savgol_butter_margin: float = 0.1,
-        # Butterworth specific parameters
+        # Butterworth parameters
         butter_order: int = 4,
         # Output control
-        verbose: bool = True,
-        include_residual: bool = False,
+        verbose: bool = False,
     ):
-        """Initialize the bandpass signal decomposer.
+        """Initialize the bandpass decomposer.
 
         Args:
-            freq: Number of observations per day
-                - 15-min data: 96
-                - 30-min data: 48
-                - Hourly data: 24
-            period_pairs: List of (period_low, period_high) tuples in days.
-                Each pair defines a frequency band to extract.
-                Example: [(0.5, 1), (1, 7), (7, 28)]
-            filter_type: Type of filter
-                - 'savgol': Savitzky-Golay (difference of two lowpass filters)
-                - 'butterworth': Butterworth IIR bandpass filter
-            mode: How to handle NaN values in output
-                - 'drop': Remove rows with NaN
-                - 'keep': Keep all rows
+            freq: Number of observations per day (96 for 15-min data)
+            period_pairs: List of (period_low, period_high) tuples in days
+            filter_type: 'savgol' or 'butterworth'
+            mode: 'drop' or 'keep' NaN rows
+
             nan_fill: Method to fill NaN before filtering
-                - 'periodic': Use same hour from adjacent days (best for daily cycles)
-                - 'linear': Linear interpolation
-                - 'ffill': Forward fill then backward fill
-            nan_fill_period: Period in days for periodic fill (default: 1.0 for daily)
-            nan_fill_max_gap: Maximum gap size in periods for periodic fill
-            edge_method: Method to mitigate edge effects
-                - 'none': No padding (worst edge effects)
-                - 'reflect': Reflect signal at edges (recommended)
-                - 'symmetric': Symmetric reflection including endpoint
-                - 'constant': Pad with edge values
-                - 'extrapolate': Linear extrapolation at edges
-            edge_pad_periods: How many periods to pad at each edge (default: 2.0)
-            use_edge_weighting: If True, apply exponential weighting to trust recent data more
-            edge_weight_decay: Decay rate for edge weighting
-            savgol_polyorder: Polynomial order for Savitzky-Golay filter
-            savgol_butter_cleanup: If True, apply Butterworth bandpass after Savitzky-Golay
-            savgol_butter_margin: Frequency margin for Butterworth cleanup
+            nan_fill_period: Period in days for periodic fill
+            nan_fill_max_gap: Max gap size for periodic fill
+
+            edge_method: Pre-filter padding method for scipy filtfilt
+            edge_pad_periods: How many periods to pad at each edge (pre-filter)
+
+            pad_method: Post-filter edge correction method
+                - 'none': No post-filter correction
+                - 'periodic': Copy from ±1 period away (preserves local amplitude)
+                - 'stl': STL decomposition extrapolation (mean-adjusted)
+                - 'arima': ARIMA forecasting (captures local dynamics)
+            pad_num_periods: Number of periods to replace at each edge
+            pad_max_periods: Max pad size in periods (caps low-freq bands)
+            pad_target_periods: Dict mapping band_idx to exact period_obs for STL/ARIMA
+            pad_arima_order: ARIMA order (p, d, q) for arima method
+            pad_bands: List of band indices to apply padding to (None = all bands)
+
+            savgol_polyorder: Polynomial order for Savitzky-Golay
             butter_order: Order of Butterworth filter
-            verbose: Whether to print progress messages
-            include_residual: Whether to include residual (original - reconstructed) as feature
+            verbose: Print progress messages
         """
         self.freq = freq
         self.filter_type = filter_type
         self.mode = mode
         self.verbose = verbose
-        self.include_residual = include_residual
 
-        # NaN handling parameters
+        # NaN handling
         self.nan_fill = nan_fill
         self.nan_fill_period = nan_fill_period
         self.nan_fill_max_gap = nan_fill_max_gap
 
-        # Edge effect parameters
+        # Pre-filter edge padding
         self.edge_method = edge_method
         self.edge_pad_periods = edge_pad_periods
-        self.use_edge_weighting = use_edge_weighting
-        self.edge_weight_decay = edge_weight_decay
 
-        # Set default period pairs if not provided
+        # Post-filter edge correction (pad_*)
+        self.pad_method = pad_method
+        self.pad_num_periods = pad_num_periods
+        self.pad_max_periods = pad_max_periods
+        self.pad_target_periods = pad_target_periods or {}
+        self.pad_arima_order = pad_arima_order
+        self.pad_bands = pad_bands  # None means all bands
+
+        # Period pairs
         if period_pairs is None:
             self.period_pairs = [
-                (0.25, 0.75),   # Sub-daily
-                (0.75, 1.25),   # Daily
-                (1.5, 7.0),     # Weekly
-                (7.0, 30.0),    # Monthly
-                (30.0, 180.0),  # Trend
+                (0.25, 0.75),
+                (0.75, 1.25),
+                (1.5, 7.0),
+                (7.0, 30.0),
             ]
         else:
             self.period_pairs = period_pairs
 
-        # Savitzky-Golay parameters
+        # Filter parameters
         self.savgol_polyorder = savgol_polyorder
-        self.savgol_butter_cleanup = savgol_butter_cleanup
-        self.savgol_butter_margin = savgol_butter_margin
-
-        # Butterworth parameters
         self.butter_order = butter_order
 
-        # Calculate filter specifications
         self._filter_specs = self._calculate_filter_specs()
 
-    def _calculate_filter_specs(self) -> List[dict]:
+    def _calculate_filter_specs(self) -> list[dict]:
         """Calculate filter specifications for each frequency band."""
         specs = []
 
@@ -282,85 +278,76 @@ class BandpassDecomposer:
             period_high_obs = period_high * self.freq
 
             spec = {
-                'name': f'band_{i}',
-                'period_low_days': period_low,
-                'period_high_days': period_high,
-                'period_low_obs': period_low_obs,
-                'period_high_obs': period_high_obs,
+                "name": f"band_{i}",
+                "period_low_days": period_low,
+                "period_high_days": period_high,
+                "period_low_obs": period_low_obs,
+                "period_high_obs": period_high_obs,
             }
 
-            if self.filter_type == 'savgol':
+            if self.filter_type == "savgol":
                 low_window = int(period_low_obs * 1.5)
                 high_window = int(period_high_obs * 1.5)
-
                 low_window = max(self.savgol_polyorder + 2, low_window)
                 high_window = max(self.savgol_polyorder + 2, high_window)
-
                 if low_window % 2 == 0:
                     low_window += 1
                 if high_window % 2 == 0:
                     high_window += 1
+                spec["low_window"] = low_window
+                spec["high_window"] = high_window
 
-                spec['low_window'] = low_window
-                spec['high_window'] = high_window
-
-            elif self.filter_type == 'butterworth':
+            elif self.filter_type == "butterworth":
                 nyquist = 0.5
                 f_low = 1 / period_high_obs
                 f_high = 1 / period_low_obs
+                spec["lowcut"] = max(0.001, min(0.999, f_low / nyquist))
+                spec["highcut"] = max(0.001, min(0.999, f_high / nyquist))
+                if spec["lowcut"] >= spec["highcut"]:
+                    mid = (spec["lowcut"] + spec["highcut"]) / 2
+                    spec["lowcut"] = mid * 0.8
+                    spec["highcut"] = mid * 1.2
 
-                spec['lowcut'] = max(0.001, min(0.999, f_low / nyquist))
-                spec['highcut'] = max(0.001, min(0.999, f_high / nyquist))
-
-                if spec['lowcut'] >= spec['highcut']:
-                    mid = (spec['lowcut'] + spec['highcut']) / 2
-                    spec['lowcut'] = mid * 0.8
-                    spec['highcut'] = mid * 1.2
-
-            spec['pad_length'] = int(self.edge_pad_periods * max(period_low_obs, period_high_obs))
+            spec["pad_length"] = int(self.edge_pad_periods * max(period_low_obs, period_high_obs))
             specs.append(spec)
 
         return specs
 
-    def _pad_signal(self, y: np.ndarray, pad_length: int) -> Tuple[np.ndarray, int]:
-        """Pad signal at edges to reduce edge effects."""
-        if self.edge_method == 'none' or pad_length <= 0:
+    # =========================================================================
+    # Pre-filter padding methods (for scipy filtfilt)
+    # =========================================================================
+
+    def _pad_signal(self, y: np.ndarray, pad_length: int) -> tuple[np.ndarray, int]:
+        """Pad signal at edges to reduce edge effects (pre-filter)."""
+        if self.edge_method == "none" or pad_length <= 0:
             return y, 0
 
         n = len(y)
         pad_length = min(pad_length, n - 1)
-
         if pad_length < 1:
             return y, 0
 
-        if self.edge_method == 'reflect':
-            left_pad = y[1:pad_length+1][::-1]
-            right_pad = y[-(pad_length+1):-1][::-1]
-
-        elif self.edge_method == 'symmetric':
+        if self.edge_method == "reflect":
+            left_pad = y[1 : pad_length + 1][::-1]
+            right_pad = y[-(pad_length + 1) : -1][::-1]
+        elif self.edge_method == "symmetric":
             left_pad = y[:pad_length][::-1]
             right_pad = y[-pad_length:][::-1]
-
-        elif self.edge_method == 'constant':
+        elif self.edge_method == "constant":
             left_pad = np.full(pad_length, y[0])
             right_pad = np.full(pad_length, y[-1])
-
-        elif self.edge_method == 'extrapolate':
+        elif self.edge_method == "extrapolate":
             n_fit = min(pad_length, n // 4, 100)
             n_fit = max(2, n_fit)
-
             left_slope, left_intercept = np.polyfit(np.arange(n_fit), y[:n_fit], 1)
             left_pad = left_intercept + left_slope * np.arange(-pad_length, 0)
-
             right_x = np.arange(n - n_fit, n)
             right_slope, right_intercept = np.polyfit(right_x, y[-n_fit:], 1)
             right_pad = right_intercept + right_slope * np.arange(n, n + pad_length)
-
         else:
             return y, 0
 
-        padded = np.concatenate([left_pad, y, right_pad])
-        return padded, pad_length
+        return np.concatenate([left_pad, y, right_pad]), pad_length
 
     def _unpad_signal(self, y_padded: np.ndarray, pad_length: int) -> np.ndarray:
         """Remove padding from signal."""
@@ -368,51 +355,198 @@ class BandpassDecomposer:
             return y_padded
         return y_padded[pad_length:-pad_length]
 
-    def _apply_edge_weighting(self, original: np.ndarray, filtered: np.ndarray) -> np.ndarray:
-        """Apply exponential weighting to blend filtered result with original at edges."""
-        if not self.use_edge_weighting:
-            return filtered
+    # =========================================================================
+    # Post-filter edge correction methods (pad_*)
+    # =========================================================================
 
-        n = len(filtered)
-        result = filtered.copy()
-        edge_region = min(n // 10, 100)
+    def _pad_periodic(self, band: np.ndarray, period_obs: int, num_periods: int) -> np.ndarray:
+        """
+        Fix edges by copying from ±1 period away.
 
-        if edge_region < 2:
-            return filtered
+        Preserves local amplitude - best for real data with amplitude variation.
 
-        weights = np.ones(edge_region)
-        decay_indices = np.arange(edge_region)
-        weights = 1.0 - 0.5 * (1 - np.exp(-self.edge_weight_decay * (edge_region - decay_indices)))
+        Args:
+            band: Signal array (already filtered)
+            period_obs: Period in observations
+            num_periods: Number of periods to replace at each edge
+        """
+        band_fixed = band.copy()
+        n = len(band)
+        pad_len = num_periods * period_obs
 
-        fit_region = min(edge_region * 2, n // 2)
-        if fit_region >= 2:
-            x_fit = np.arange(n - fit_region, n)
-            slope, intercept = np.polyfit(x_fit, original[n - fit_region:], 1)
-            local_trend = intercept + slope * np.arange(n - edge_region, n)
+        if pad_len > n // 3:
+            return band_fixed
 
-            result[-edge_region:] = (
-                weights * filtered[-edge_region:] +
-                (1 - weights) * local_trend
-            )
+        # Right edge: copy from 1 period earlier
+        for i in range(pad_len):
+            idx = n - pad_len + i
+            src_idx = idx - period_obs
+            if 0 <= src_idx < n - pad_len:
+                band_fixed[idx] = band[src_idx]
 
-        return result
+        # Left edge: copy from 1 period later
+        for i in range(pad_len):
+            src_idx = i + period_obs
+            if pad_len <= src_idx < n:
+                band_fixed[i] = band[src_idx]
+
+        return band_fixed
+
+    def _pad_stl(self, band: np.ndarray, period_obs: int, num_periods: int) -> np.ndarray:
+        """
+        Fix edges using STL decomposition with phase-aligned extrapolation.
+
+        Mean-adjusted to avoid bias. Good for stationary periodic signals.
+
+        Args:
+            band: Signal array (already filtered)
+            period_obs: Period in observations (must match dominant frequency)
+            num_periods: Number of periods to replace at each edge
+        """
+
+        n = len(band)
+        band_fixed = band.copy()
+        pad_len = num_periods * period_obs
+
+        if n < 3 * pad_len:
+            return band_fixed
+
+        middle = band[pad_len:-pad_len]
+        middle_mean = np.mean(middle)
+
+        if len(middle) < 2 * period_obs:
+            return band_fixed
+
+        try:
+            stl = STL(middle, period=period_obs, seasonal=7, robust=True).fit()
+            seasonal = stl.seasonal
+            middle_len = len(middle)
+            one_period = seasonal[-period_obs:]
+
+            # Right edge - phase aligned, mean adjusted
+            right_phases = (middle_len + np.arange(pad_len)) % period_obs
+            right_seasonal = one_period[right_phases]
+            band_fixed[-pad_len:] = right_seasonal - np.mean(right_seasonal) + middle_mean
+
+            # Left edge - phase aligned, mean adjusted
+            left_phases = np.arange(-pad_len, 0) % period_obs
+            left_seasonal = one_period[left_phases]
+            band_fixed[:pad_len] = left_seasonal - np.mean(left_seasonal) + middle_mean
+
+        except Exception as e:
+            if self.verbose:
+                warnings.warn(f"STL padding failed: {e}", stacklevel=2)
+
+        return band_fixed
+
+    def _pad_arima(self, band: np.ndarray, period_obs: int, num_periods: int) -> np.ndarray:
+        """
+        Fix edges using ARIMA forecasting.
+
+        Captures local dynamics - best for real data with amplitude variation.
+        Note: Can be unstable for num_periods > 1.
+
+        Args:
+            band: Signal array (already filtered)
+            period_obs: Period in observations
+            num_periods: Number of periods to replace at each edge
+        """
+        from statsmodels.tsa.arima.model import ARIMA
+
+        n = len(band)
+        band_fixed = band.copy()
+        pad_len = num_periods * period_obs
+
+        if n < 3 * pad_len:
+            return band_fixed
+
+        middle = band[pad_len:-pad_len]
+
+        try:
+            # Fit ARIMA on middle section and forecast right edge
+            model = ARIMA(middle, order=self.pad_arima_order)
+            fitted = model.fit()
+            forecast_right = fitted.forecast(steps=pad_len)
+            band_fixed[-pad_len:] = forecast_right
+
+            # For left edge, fit on reversed middle and forecast
+            model_left = ARIMA(middle[::-1], order=self.pad_arima_order)
+            fitted_left = model_left.fit()
+            forecast_left = fitted_left.forecast(steps=pad_len)
+            band_fixed[:pad_len] = forecast_left[::-1]
+
+        except Exception as e:
+            if self.verbose:
+                warnings.warn(f"ARIMA padding failed: {e}", stacklevel=2)
+
+        return band_fixed
+
+    def _apply_pad_correction(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Apply post-filter edge correction to selected bands."""
+        if self.pad_method == "none":
+            return df
+
+        for band_idx, (p_lo, p_hi) in enumerate(self.period_pairs):
+            # Skip bands not in pad_bands (if specified)
+            if self.pad_bands is not None and band_idx not in self.pad_bands:
+                if self.verbose:
+                    print(f"  Skip band_{band_idx} (not in pad_bands)")
+                continue
+
+            band_col = f"y_band_{band_idx}"
+
+            if band_col not in df.columns:
+                continue
+
+            band = df[band_col].values
+
+            # Get period_obs: use target if specified, otherwise use band center
+            if band_idx in self.pad_target_periods:
+                period_obs = self.pad_target_periods[band_idx]
+            else:
+                center_period_days = (p_lo + p_hi) / 2
+                period_obs = max(2, int(center_period_days * self.freq))
+
+            # Cap num_periods by pad_max_periods
+            max_periods = int(self.pad_max_periods * self.freq / period_obs)
+            num_periods = min(self.pad_num_periods, max(1, max_periods))
+
+            if self.verbose:
+                print(
+                    f"  Pad {band_col} ({p_lo}-{p_hi}d): method={self.pad_method}, "
+                    f"period={period_obs}, num_periods={num_periods}"
+                )
+
+            # Apply padding method
+            if self.pad_method == "periodic":
+                df[band_col] = self._pad_periodic(band, period_obs, num_periods)
+            elif self.pad_method == "stl":
+                df[band_col] = self._pad_stl(band, period_obs, num_periods)
+            elif self.pad_method == "arima":
+                df[band_col] = self._pad_arima(band, period_obs, num_periods)
+
+        return df
+
+    # =========================================================================
+    # Filter methods
+    # =========================================================================
 
     def _apply_savgol_bandpass(
         self,
-        y: np.ndarray,
-        low_window: int,
-        high_window: int,
-        name: str,
-        pad_length: int,
-        is_trend: bool = False,
-        period_low_days: float = None,
-        period_high_days: float = None
-    ) -> np.ndarray:
-        """Apply Savitzky-Golay bandpass filter with edge padding."""
+        y,
+        low_window,
+        high_window,
+        name,
+        pad_length,
+        is_trend=False,
+        period_low_days=None,
+        period_high_days=None,
+    ):
+        """Apply Savitzky-Golay bandpass filter."""
         y_padded, actual_pad = self._pad_signal(y, pad_length)
 
         if len(y_padded) < max(low_window, high_window):
-            warnings.warn(f"{name}: Signal too short for window sizes. Returning NaN.")
+            warnings.warn(f"{name}: Signal too short for window sizes.", stacklevel=2)
             return np.full_like(y, np.nan)
 
         nyquist_length = len(y_padded) // 2
@@ -421,260 +555,123 @@ class BandpassDecomposer:
             if high_window > nyquist_length or is_trend:
                 if low_window > len(y_padded):
                     low_window = len(y_padded) if len(y_padded) % 2 == 1 else len(y_padded) - 1
-
-                lowpass = savgol_filter(y_padded, low_window, self.savgol_polyorder, mode='nearest')
+                lowpass = savgol_filter(y_padded, low_window, self.savgol_polyorder, mode="nearest")
                 bandpass = self._unpad_signal(lowpass, actual_pad)
-
-                if self.savgol_butter_cleanup and period_low_days is not None:
-                    bandpass = self._apply_butter_lowpass(bandpass, period_low_days, name)
-
             else:
-                lowpass_low = savgol_filter(y_padded, low_window, self.savgol_polyorder, mode='nearest')
-                lowpass_high = savgol_filter(y_padded, high_window, self.savgol_polyorder, mode='nearest')
-
+                lowpass_low = savgol_filter(
+                    y_padded, low_window, self.savgol_polyorder, mode="nearest"
+                )
+                lowpass_high = savgol_filter(
+                    y_padded, high_window, self.savgol_polyorder, mode="nearest"
+                )
                 bandpass_padded = lowpass_low - lowpass_high
                 bandpass = self._unpad_signal(bandpass_padded, actual_pad)
 
-                if self.savgol_butter_cleanup and period_low_days is not None:
-                    bandpass = self._apply_butter_bandpass_cleanup(
-                        bandpass, period_low_days, period_high_days, name
-                    )
-
-            bandpass = self._apply_edge_weighting(y, bandpass)
             return bandpass
 
         except Exception as e:
-            warnings.warn(f"Error in Savitzky-Golay for {name}: {e}")
+            warnings.warn(f"Error in Savitzky-Golay for {name}: {e}", stacklevel=2)
             return np.full_like(y, np.nan)
 
-    def _apply_butterworth_bandpass(
-        self,
-        y: np.ndarray,
-        lowcut: float,
-        highcut: float,
-        name: str,
-        pad_length: int,
-        is_trend: bool = False
-    ) -> np.ndarray:
-        """Apply Butterworth bandpass filter with edge padding."""
+    def _apply_butterworth_bandpass(self, y, lowcut, highcut, name, pad_length, is_trend=False):
+        """Apply Butterworth bandpass filter."""
         y_padded, actual_pad = self._pad_signal(y, pad_length)
 
         try:
             if is_trend or (highcut - lowcut) < 0.001:
-                sos = butter(self.butter_order, highcut, btype='low', output='sos')
+                sos = butter(self.butter_order, highcut, btype="low", output="sos")
             else:
-                sos = butter(self.butter_order, [lowcut, highcut], btype='band', output='sos')
+                sos = butter(self.butter_order, [lowcut, highcut], btype="band", output="sos")
 
-            filtered_padded = sosfiltfilt(sos, y_padded, padtype='odd', padlen=min(100, len(y_padded)//4))
-            filtered = self._unpad_signal(filtered_padded, actual_pad)
-            filtered = self._apply_edge_weighting(y, filtered)
-
-            return filtered
+            filtered_padded = sosfiltfilt(
+                sos, y_padded, padtype="odd", padlen=min(100, len(y_padded) // 4)
+            )
+            return self._unpad_signal(filtered_padded, actual_pad)
 
         except Exception as e:
-            warnings.warn(f"Error in Butterworth for {name}: {e}")
+            warnings.warn(f"Error in Butterworth for {name}: {e}", stacklevel=2)
             return np.full_like(y, np.nan)
 
-    def _apply_butter_bandpass_cleanup(
-        self,
-        signal: np.ndarray,
-        period_low_days: float,
-        period_high_days: float,
-        name: str
-    ) -> np.ndarray:
-        """Apply Butterworth bandpass to clean up SavGol output."""
-        try:
-            period_low_obs = period_low_days * self.freq
-            period_high_obs = period_high_days * self.freq
-
-            nyquist = 0.5
-            f_low = 1 / period_high_obs
-            f_high = 1 / period_low_obs
-
-            margin = self.savgol_butter_margin
-            lowcut = max(0.001, min(0.999, f_low * (1 - margin) / nyquist))
-            highcut = max(0.001, min(0.999, f_high * (1 + margin) / nyquist))
-
-            if lowcut >= highcut:
-                return signal
-
-            sos = butter(self.butter_order, [lowcut, highcut], btype='band', output='sos')
-            return sosfiltfilt(sos, signal, padtype='odd', padlen=min(50, len(signal)//4))
-
-        except Exception as e:
-            warnings.warn(f"Butterworth cleanup failed for {name}: {e}")
-            return signal
-
-    def _apply_butter_lowpass(
-        self,
-        signal: np.ndarray,
-        period_low_days: float,
-        name: str
-    ) -> np.ndarray:
-        """Apply Butterworth lowpass for trend extraction."""
-        try:
-            period_low_obs = period_low_days * self.freq
-            nyquist = 0.5
-            f_high = 1 / period_low_obs
-
-            margin = self.savgol_butter_margin
-            highcut = max(0.001, min(0.999, f_high * (1 + margin) / nyquist))
-
-            sos = butter(self.butter_order, highcut, btype='low', output='sos')
-            return sosfiltfilt(sos, signal, padtype='odd', padlen=min(50, len(signal)//4))
-
-        except Exception as e:
-            warnings.warn(f"Butterworth lowpass failed for {name}: {e}")
-            return signal
+    # =========================================================================
+    # Main decompose method
+    # =========================================================================
 
     def decompose(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Decompose time series into bandpass-filtered frequency components.
-
-        Args:
-            df: Input dataframe with columns:
-                - ds (datetime): Timestamps
-                - y (float): Target values
-
-        Returns:
-            DataFrame with original columns plus bandpass components:
-                - y_band_0, y_band_1, ...: Bandpass components for each period pair
-        """
+        """Decompose time series into bandpass-filtered frequency components."""
         df = df.copy()
 
-        if 'y' not in df.columns:
-            if 'tempMean' in df.columns:
-                df['y'] = df['tempMean']
+        if "y" not in df.columns:
+            if "temperature" in df.columns:
+                df["y"] = df["temperature"]
+            elif "tempMean" in df.columns:
+                df["y"] = df["tempMean"]
             else:
-                raise ValueError("Column 'y' or 'tempMean' not found.")
+                raise ValueError("Column 'y', 'temperature', or 'tempMean' not found.")
 
-        nan_count = df['y'].isna().sum()
+        nan_count = df["y"].isna().sum()
 
-        # Fill NaN values based on method
         if nan_count > 0:
-            if self.nan_fill == 'periodic':
+            if self.nan_fill == "periodic":
                 y_filled = fill_nan_periodic(
-                    df['y'].values,
-                    freq=self.freq,
-                    period_days=self.nan_fill_period,
-                    max_gap_periods=self.nan_fill_max_gap,
-                    verbose=self.verbose,
+                    df["y"].values,
+                    self.freq,
+                    self.nan_fill_period,
+                    self.nan_fill_max_gap,
+                    self.verbose,
                 )
-            elif self.nan_fill == 'linear':
-                y_filled = df['y'].interpolate(method='linear').ffill().bfill().values
-                if self.verbose:
-                    print(f"Filled {nan_count} NaN values using linear interpolation")
-            else:  # ffill
-                y_filled = df['y'].ffill().bfill().values
-                if self.verbose:
-                    print(f"Filled {nan_count} NaN values using forward/backward fill")
+            elif self.nan_fill == "linear":
+                y_filled = df["y"].interpolate(method="linear").ffill().bfill().values
+            else:
+                y_filled = df["y"].ffill().bfill().values
         else:
-            y_filled = df['y'].values
+            y_filled = df["y"].values
 
         if self.verbose:
-            print(f"\n{'='*70}")
-            print(f"Bandpass Decomposition - {self.filter_type.upper()}")
-            print(f"{'='*70}")
-            print(f"Data frequency: {self.freq} obs/day")
-            print(f"Data length: {len(y_filled)} observations ({len(y_filled)/self.freq:.1f} days)")
-            print(f"NaN handling: {self.nan_fill} (period={self.nan_fill_period}d)")
-            print(f"Edge method: {self.edge_method} (pad={self.edge_pad_periods} periods)")
-            print(f"Edge weighting: {self.use_edge_weighting}")
-            print(f"Number of bands: {len(self.period_pairs)}")
-            print(f"{'='*70}\n")
+            print(f"\nBandpass Decomposition - {self.filter_type.upper()}")
+            print(f"Data: {len(y_filled)} obs ({len(y_filled) / self.freq:.1f} days)")
+            print(f"Edge method: {self.edge_method}, Pad method: {self.pad_method}")
 
         for idx, spec in enumerate(self._filter_specs):
-            name = spec['name']
-            period_low = spec['period_low_days']
-            period_high = spec['period_high_days']
-            pad_length = spec['pad_length']
-            is_trend = (idx == len(self._filter_specs) - 1)
+            name = spec["name"]
+            period_low = spec["period_low_days"]
+            period_high = spec["period_high_days"]
+            pad_length = spec["pad_length"]
+            is_trend = idx == len(self._filter_specs) - 1
 
-            if self.filter_type == 'savgol':
-                low_window = spec['low_window']
-                high_window = spec['high_window']
-                if self.verbose:
-                    print(f"Computing {name} ({period_low:.2f}-{period_high:.2f}d, "
-                          f"windows=[{low_window}, {high_window}], pad={pad_length})...")
-
-                df[f'y_{name}'] = self._apply_savgol_bandpass(
-                    y_filled, low_window, high_window, name, pad_length,
+            if self.filter_type == "savgol":
+                df[f"y_{name}"] = self._apply_savgol_bandpass(
+                    y_filled,
+                    spec["low_window"],
+                    spec["high_window"],
+                    name,
+                    pad_length,
                     is_trend=is_trend,
                     period_low_days=period_low,
-                    period_high_days=period_high
+                    period_high_days=period_high,
+                )
+            elif self.filter_type == "butterworth":
+                df[f"y_{name}"] = self._apply_butterworth_bandpass(
+                    y_filled, spec["lowcut"], spec["highcut"], name, pad_length, is_trend=is_trend
                 )
 
-            elif self.filter_type == 'butterworth':
-                lowcut = spec['lowcut']
-                highcut = spec['highcut']
-                if self.verbose:
-                    print(f"Computing {name} ({period_low:.2f}-{period_high:.2f}d, "
-                          f"freqs=[{lowcut:.4f}, {highcut:.4f}], pad={pad_length})...")
-
-                df[f'y_{name}'] = self._apply_butterworth_bandpass(
-                    y_filled, lowcut, highcut, name, pad_length, is_trend=is_trend
-                )
-
-        if self.mode == 'drop':
-            component_cols = [f'y_{spec["name"]}' for spec in self._filter_specs]
-            initial_len = len(df)
+        if self.mode == "drop":
+            component_cols = [f"y_{spec['name']}" for spec in self._filter_specs]
             df = df.dropna(subset=component_cols)
-            if self.verbose and len(df) < initial_len:
-                print(f"\nDropped {initial_len - len(df)} rows with NaN")
 
-        # Compute residual (original - reconstructed) if enabled
-        if self.include_residual:
-            reconstructed = self.reconstruct(df)
-            df['y_residual'] = y_filled - reconstructed
-
-            if self.verbose:
-                residual_std = np.std(df['y_residual'].values)
-                print(f"\nResidual std: {residual_std:.4f}")
+        # Apply post-filter edge correction
+        df = self._apply_pad_correction(df)
 
         if self.verbose:
-            print(f"\n{'='*70}")
-            print(f"Decomposition complete. Shape: {df.shape}")
-            print(f"{'='*70}\n")
+            print(f"Decomposition complete. Shape: {df.shape}\n")
 
         return df
 
-    def get_component_names(self) -> List[str]:
+    def get_component_names(self) -> list[str]:
         """Get list of component column names."""
-        names = [f'y_{spec["name"]}' for spec in self._filter_specs]
-        if self.include_residual:
-            names.append('y_residual')
-        return names
-
-    def get_component_info(self) -> pd.DataFrame:
-        """Get information about the bandpass components."""
-        info = []
-        for spec in self._filter_specs:
-            component_info = {
-                'component': f'y_{spec["name"]}',
-                'period_low_days': spec['period_low_days'],
-                'period_high_days': spec['period_high_days'],
-                'pad_length': spec['pad_length'],
-            }
-
-            if self.filter_type == 'savgol':
-                component_info['low_window'] = spec['low_window']
-                component_info['high_window'] = spec['high_window']
-            elif self.filter_type == 'butterworth':
-                component_info['lowcut'] = spec['lowcut']
-                component_info['highcut'] = spec['highcut']
-
-            info.append(component_info)
-
-        return pd.DataFrame(info)
+        return [f"y_{spec['name']}" for spec in self._filter_specs]
 
     def reconstruct(self, df: pd.DataFrame) -> np.ndarray:
-        """Reconstruct signal from bandpass components (excludes residual).
-
-        Args:
-            df: DataFrame with decomposed components
-
-        Returns:
-            Reconstructed signal as numpy array
-        """
+        """Reconstruct signal from bandpass components."""
         reconstructed = np.zeros(len(df))
         for spec in self._filter_specs:
             col = f"y_{spec['name']}"
@@ -690,6 +687,7 @@ class BandpassDecomposer:
 # Check for vmdpy availability
 try:
     from vmdpy import VMD
+
     VMDPY_AVAILABLE = True
 except ImportError:
     VMDPY_AVAILABLE = False
@@ -763,8 +761,7 @@ class RubinVMDDecomposer:
         """
         if not VMDPY_AVAILABLE:
             raise ImportError(
-                "vmdpy is required for RubinVMDDecomposer. "
-                "Install with: pip install vmdpy"
+                "vmdpy is required for RubinVMDDecomposer. Install with: pip install vmdpy"
             )
 
         self.freq = freq
@@ -781,21 +778,19 @@ class RubinVMDDecomposer:
         self.include_residual = include_residual
 
         self.butter_periods = [
-            (0.5, 2.0),      # Daily band
-            (1.5, 9.0),      # Weekly band
-            (21.0, 38.0),    # Monthly band
-            (30.0, 200.0),   # Trend band
+            (0.5, 2.0),  # Daily band
+            (1.5, 9.0),  # Weekly band
+            (21.0, 38.0),  # Monthly band
+            (30.0, 200.0),  # Trend band
         ]
 
-        self.band_names = ['vmd_daily', 'vmd_weekly', 'vmd_monthly', 'vmd_trend']
+        self.band_names = ["vmd_daily", "vmd_weekly", "vmd_monthly", "vmd_trend"]
 
     def _run_vmd(self, signal: np.ndarray, K: int) -> np.ndarray:
         """Run VMD decomposition."""
         original_length = len(signal)
 
-        u, u_hat, omega = VMD(
-            signal, self.alpha, self.tau, K, self.DC, self.init, self.tol
-        )
+        u, u_hat, omega = VMD(signal, self.alpha, self.tau, K, self.DC, self.init, self.tol)
 
         final_omega = omega[-1, :]
         sorted_indices = np.argsort(final_omega)
@@ -820,7 +815,7 @@ class RubinVMDDecomposer:
         period_low: float,
         period_high: float,
         name: str,
-        is_trend: bool = False
+        is_trend: bool = False,
     ) -> np.ndarray:
         """Apply Butterworth bandpass filter."""
         try:
@@ -838,44 +833,44 @@ class RubinVMDDecomposer:
             highcut = max(0.001, min(0.999, f_high_margin / nyquist))
 
             if is_trend or lowcut >= highcut:
-                sos = butter(self.butter_order, highcut, btype='low', output='sos')
+                sos = butter(self.butter_order, highcut, btype="low", output="sos")
             else:
-                sos = butter(self.butter_order, [lowcut, highcut], btype='band', output='sos')
+                sos = butter(self.butter_order, [lowcut, highcut], btype="band", output="sos")
 
             filtered = sosfiltfilt(sos, signal)
 
             if len(filtered) != len(signal):
                 if len(filtered) > len(signal):
-                    filtered = filtered[:len(signal)]
+                    filtered = filtered[: len(signal)]
                 else:
-                    filtered = np.pad(filtered, (0, len(signal) - len(filtered)), mode='edge')
+                    filtered = np.pad(filtered, (0, len(signal) - len(filtered)), mode="edge")
 
             return filtered
 
         except Exception as e:
-            warnings.warn(f"Error applying Butterworth for {name}: {e}")
+            warnings.warn(f"Error applying Butterworth for {name}: {e}", stacklevel=2)
             return np.full(len(signal), np.nan)
 
     def decompose(self, df: pd.DataFrame) -> pd.DataFrame:
         """Decompose time series using two-stage VMD + Butterworth."""
         df = df.copy()
 
-        if 'y' not in df.columns:
-            if 'tempMean' in df.columns:
-                df['y'] = df['tempMean']
+        if "y" not in df.columns:
+            if "tempMean" in df.columns:
+                df["y"] = df["tempMean"]
             else:
                 raise ValueError("Column 'y' or 'tempMean' not found in dataframe.")
 
-        y = df['y'].ffill().bfill().values
+        y = df["y"].ffill().bfill().values
 
         if self.verbose:
-            print(f"\n{'='*70}")
-            print(f"Rubin VMD Decomposition")
-            print(f"{'='*70}")
+            print(f"\n{'=' * 70}")
+            print("Rubin VMD Decomposition")
+            print(f"{'=' * 70}")
             print(f"Data frequency: {self.freq} obs/day")
-            print(f"Data length: {len(y)} observations ({len(y)/self.freq:.1f} days)")
+            print(f"Data length: {len(y)} observations ({len(y) / self.freq:.1f} days)")
             print(f"VMD alpha: {self.alpha}")
-            print(f"{'='*70}\n")
+            print(f"{'=' * 70}\n")
 
         # Stage 1
         if self.verbose:
@@ -885,17 +880,19 @@ class RubinVMDDecomposer:
         imf1 = imfs_stage1[0]
 
         if self.verbose:
-            print(f"  Extracted IMF1 (lowest frequency mode)")
+            print("  Extracted IMF1 (lowest frequency mode)")
             print(f"  IMF1 std: {np.std(imf1):.4f}")
-            print(f"\nApplying Butterworth bandpass to IMF1...")
+            print("\nApplying Butterworth bandpass to IMF1...")
 
-        for i, ((period_low, period_high), name) in enumerate(zip(self.butter_periods[1:], self.band_names[1:])):
-            is_trend = (i == len(self.butter_periods) - 2)
+        for i, ((period_low, period_high), name) in enumerate(
+            zip(self.butter_periods[1:], self.band_names[1:])
+        ):
+            is_trend = i == len(self.butter_periods) - 2
 
             if self.verbose:
                 print(f"  Computing {name} ({period_low:.2f}-{period_high:.1f}d)...")
 
-            df[f'y_{name}'] = self._apply_butterworth_bandpass(
+            df[f"y_{name}"] = self._apply_butterworth_bandpass(
                 imf1, period_low, period_high, name, is_trend=is_trend
             )
 
@@ -903,7 +900,7 @@ class RubinVMDDecomposer:
         if self.verbose:
             print(f"\nSTAGE 2: VMD on residual signal (K={self.K_stage2})...")
 
-        residual = y - df['y_vmd_monthly'].values - df['y_vmd_trend'].values
+        residual = y - df["y_vmd_monthly"].values - df["y_vmd_trend"].values
 
         if self.verbose:
             print(f"  Residual std: {np.std(residual):.4f}")
@@ -914,16 +911,16 @@ class RubinVMDDecomposer:
         subdaily = imfs_stage2[1]
         imf3 = imfs_stage2[2]
 
-        df['y_vmd_daily'] = self._apply_butterworth_bandpass(
-            daily, self.butter_periods[0][0], self.butter_periods[0][1], 'vmd_daily'
+        df["y_vmd_daily"] = self._apply_butterworth_bandpass(
+            daily, self.butter_periods[0][0], self.butter_periods[0][1], "vmd_daily"
         )
-        df['y_subdaily'] = subdaily
-        df['y_imf3'] = imf3
+        df["y_subdaily"] = subdaily
+        df["y_imf3"] = imf3
 
         # Compute residual (original - reconstructed) if enabled
         if self.include_residual:
             reconstructed = self.reconstruct(df)
-            df['y_residual'] = y - reconstructed
+            df["y_residual"] = y - reconstructed
 
         if self.verbose:
             print(f"  Extracted sub-daily (IMF2, std: {np.std(subdaily):.4f})")
@@ -931,48 +928,88 @@ class RubinVMDDecomposer:
             if self.include_residual:
                 print(f"  Residual std: {np.std(df['y_residual'].values):.4f}")
 
-            print(f"\n{'='*70}")
-            print(f"Decomposition complete!")
-            print(f"{'='*70}")
-            print(f"\nOutput components (high freq -> low freq):")
-            print(f"  1. y_imf3        : Highest freq / noise")
-            print(f"  2. y_subdaily    : Sub-daily component")
+            print(f"\n{'=' * 70}")
+            print("Decomposition complete!")
+            print(f"{'=' * 70}")
+            print("\nOutput components (high freq -> low freq):")
+            print("  1. y_imf3        : Highest freq / noise")
+            print("  2. y_subdaily    : Sub-daily component")
             print(f"  3. y_vmd_daily   : {self.butter_periods[0]} days")
             print(f"  4. y_vmd_weekly  : {self.butter_periods[1]} days")
             print(f"  5. y_vmd_monthly : {self.butter_periods[2]} days")
             print(f"  6. y_vmd_trend   : {self.butter_periods[3]} days")
             if self.include_residual:
-                print(f"  7. y_residual    : Reconstruction residual")
+                print("  7. y_residual    : Reconstruction residual")
             print(f"\nDataset shape: {df.shape}")
-            print(f"{'='*70}\n")
+            print(f"{'=' * 70}\n")
 
         return df
 
-    def get_component_names(self) -> List[str]:
+    def get_component_names(self) -> list[str]:
         """Get list of component column names."""
-        names = ['y_imf3', 'y_subdaily', 'y_vmd_daily', 'y_vmd_weekly', 'y_vmd_monthly', 'y_vmd_trend']
+        names = [
+            "y_imf3",
+            "y_subdaily",
+            "y_vmd_daily",
+            "y_vmd_weekly",
+            "y_vmd_monthly",
+            "y_vmd_trend",
+        ]
         if self.include_residual:
-            names.append('y_residual')
+            names.append("y_residual")
         return names
 
     def get_component_info(self) -> pd.DataFrame:
         """Get information about the decomposed components."""
         info = [
-            {'component': 'y_imf3', 'source': 'Residual VMD (Stage 2)', 'period': 'Very high freq'},
-            {'component': 'y_subdaily', 'source': 'Residual VMD (Stage 2)', 'period': 'Sub-daily (~12h)'},
-            {'component': 'y_vmd_daily', 'source': 'Butterworth on IMF1', 'period': f'{self.butter_periods[0]} days'},
-            {'component': 'y_vmd_weekly', 'source': 'Butterworth on IMF1', 'period': f'{self.butter_periods[1]} days'},
-            {'component': 'y_vmd_monthly', 'source': 'Butterworth on IMF1', 'period': f'{self.butter_periods[2]} days'},
-            {'component': 'y_vmd_trend', 'source': 'Butterworth on IMF1', 'period': f'{self.butter_periods[3]} days'},
+            {"component": "y_imf3", "source": "Residual VMD (Stage 2)", "period": "Very high freq"},
+            {
+                "component": "y_subdaily",
+                "source": "Residual VMD (Stage 2)",
+                "period": "Sub-daily (~12h)",
+            },
+            {
+                "component": "y_vmd_daily",
+                "source": "Butterworth on IMF1",
+                "period": f"{self.butter_periods[0]} days",
+            },
+            {
+                "component": "y_vmd_weekly",
+                "source": "Butterworth on IMF1",
+                "period": f"{self.butter_periods[1]} days",
+            },
+            {
+                "component": "y_vmd_monthly",
+                "source": "Butterworth on IMF1",
+                "period": f"{self.butter_periods[2]} days",
+            },
+            {
+                "component": "y_vmd_trend",
+                "source": "Butterworth on IMF1",
+                "period": f"{self.butter_periods[3]} days",
+            },
         ]
         if self.include_residual:
-            info.append({'component': 'y_residual', 'source': 'Original - Reconstructed', 'period': 'Reconstruction error'})
+            info.append(
+                {
+                    "component": "y_residual",
+                    "source": "Original - Reconstructed",
+                    "period": "Reconstruction error",
+                }
+            )
         return pd.DataFrame(info)
 
     def reconstruct(self, df: pd.DataFrame) -> np.ndarray:
         """Reconstruct the original signal from components (excludes residual)."""
         # Use base components only, not residual
-        components = ['y_imf3', 'y_subdaily', 'y_vmd_daily', 'y_vmd_weekly', 'y_vmd_monthly', 'y_vmd_trend']
+        components = [
+            "y_imf3",
+            "y_subdaily",
+            "y_vmd_daily",
+            "y_vmd_weekly",
+            "y_vmd_monthly",
+            "y_vmd_trend",
+        ]
         reconstructed = np.zeros(len(df))
         for comp in components:
             if comp in df.columns:
@@ -984,15 +1021,16 @@ class RubinVMDDecomposer:
 # Convenience Functions
 # =============================================================================
 
+
 def preprocess_for_forecast(
     df: pd.DataFrame,
     decompose: bool = True,
     freq: int = 96,
-    period_pairs: Optional[List[Tuple[float, float]]] = None,
-    filter_type: Literal['savgol', 'butterworth'] = 'butterworth',
+    period_pairs: Optional[list[tuple[float, float]]] = None,
+    filter_type: Literal["savgol", "butterworth"] = "butterworth",
     train_start_date: str | pd.Timestamp | None = None,
     train_end_date: str | pd.Timestamp | None = None,
-    **decomposer_kwargs
+    **decomposer_kwargs,
 ) -> pd.DataFrame:
     """Preprocess data for forecasting with optional bandpass decomposition.
 
@@ -1021,28 +1059,28 @@ def preprocess_for_forecast(
     """
     df = df.copy()
 
-    if 'ds' in df.columns:
-        df['ds'] = pd.to_datetime(df['ds'])
+    if "ds" in df.columns:
+        df["ds"] = pd.to_datetime(df["ds"])
 
-    df = df.sort_values('ds').reset_index(drop=True)
+    df = df.sort_values("ds").reset_index(drop=True)
 
     if decompose:
         decomposer = BandpassDecomposer(
             freq=freq,
             period_pairs=period_pairs,
             filter_type=filter_type,
-            mode='keep',
-            **decomposer_kwargs
+            mode="keep",
+            **decomposer_kwargs,
         )
         df = decomposer.decompose(df)
 
     if train_end_date is not None:
         train_end_date = pd.to_datetime(train_end_date)
-        df = df[df['ds'] <= train_end_date]
+        df = df[df["ds"] <= train_end_date]
 
     if train_start_date is not None:
         train_start_date = pd.to_datetime(train_start_date)
-        df = df[df['ds'] >= train_start_date]
+        df = df[df["ds"] >= train_start_date]
 
     return df.reset_index(drop=True)
 
@@ -1057,21 +1095,22 @@ if __name__ == "__main__":
     # Create synthetic data (15-min frequency = 96 obs/day)
     np.random.seed(42)
     freq = 96
-    dates = pd.date_range('2023-01-01', '2023-07-01', freq='15min')
+    dates = pd.date_range("2023-01-01", "2023-07-01", freq="15min")
     n = len(dates)
     t = np.arange(n)
 
     # Synthetic signal with multiple frequencies
     y = (
-        6 * np.sin(2 * np.pi * t / (freq * 0.5)) +      # Sub-daily (12h)
-        10 * np.sin(2 * np.pi * t / freq) +              # Daily (24h)
-        5 * np.sin(2 * np.pi * t / (freq * 7)) +         # Weekly
-        3 * np.sin(2 * np.pi * t / (freq * 28)) +        # Monthly
-        np.random.randn(n) * 0.5 +                       # Noise
-        20 + 0.002 * t                                    # Trend
+        6 * np.sin(2 * np.pi * t / (freq * 0.5))  # Sub-daily (12h)
+        + 10 * np.sin(2 * np.pi * t / freq)  # Daily (24h)
+        + 5 * np.sin(2 * np.pi * t / (freq * 7))  # Weekly
+        + 3 * np.sin(2 * np.pi * t / (freq * 28))  # Monthly
+        + np.random.randn(n) * 0.5  # Noise
+        + 20
+        + 0.002 * t  # Trend
     )
 
-    df = pd.DataFrame({'ds': dates, 'y': y})
+    df = pd.DataFrame({"ds": dates, "y": y})
 
     # =========================================================================
     # Test BandpassDecomposer
@@ -1083,14 +1122,14 @@ if __name__ == "__main__":
     decomposer = BandpassDecomposer(
         freq=freq,
         period_pairs=[
-            (0.25, 0.75),   # Sub-daily
-            (0.75, 1.25),   # Daily
-            (1.5, 7.0),     # Weekly
-            (7.0, 30.0),    # Monthly
+            (0.25, 0.75),  # Sub-daily
+            (0.75, 1.25),  # Daily
+            (1.5, 7.0),  # Weekly
+            (7.0, 30.0),  # Monthly
             (30.0, 180.0),  # Trend
         ],
-        filter_type='butterworth',
-        edge_method='reflect',
+        filter_type="butterworth",
+        edge_method="reflect",
         edge_pad_periods=2.0,
     )
 
@@ -1101,7 +1140,7 @@ if __name__ == "__main__":
 
     # Test reconstruction
     reconstructed = decomposer.reconstruct(df_decomposed)
-    reconstruction_rmse = np.sqrt(np.mean((df_decomposed['y'].values - reconstructed) ** 2))
+    reconstruction_rmse = np.sqrt(np.mean((df_decomposed["y"].values - reconstructed) ** 2))
     print(f"\nReconstruction RMSE: {reconstruction_rmse:.4f}")
 
     # =========================================================================
@@ -1126,7 +1165,7 @@ if __name__ == "__main__":
 
         # Test reconstruction
         reconstructed_vmd = vmd_decomposer.reconstruct(df_vmd)
-        reconstruction_rmse_vmd = np.sqrt(np.mean((df_vmd['y'].values - reconstructed_vmd) ** 2))
+        reconstruction_rmse_vmd = np.sqrt(np.mean((df_vmd["y"].values - reconstructed_vmd) ** 2))
         print(f"\nReconstruction RMSE: {reconstruction_rmse_vmd:.4f}")
     else:
         print("\n[Skipping RubinVMDDecomposer test - vmdpy not installed]")

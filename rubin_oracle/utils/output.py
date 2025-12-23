@@ -41,9 +41,10 @@ class OutputFormatter:
 
         # Add step column: enumerate forecast timestamps
         result["step"] = range(1, len(result) + 1)
+        result["lead_time"] = result["step"] * pd.to_timedelta(freq).total_seconds() / 3600.0
 
         # Reorder columns
-        cols = ["ds", "yhat", "yhat_lower", "yhat_upper", "step"]
+        cols = ["ds", "yhat", "yhat_lower", "yhat_upper", "lead_time", "step"]
         available_cols = [col for col in cols if col in result.columns]
         result = result[available_cols]
 
@@ -57,6 +58,8 @@ class OutputFormatter:
 
         NeuralProphet outputs wide format with yhat1, yhat2, ..., yhat{n_forecast}
         columns. This converts to long format (one row per step per timestamp).
+
+        Rolling back windows
 
         Args:
             df: NeuralProphet forecast with columns ds, yhat1, yhat2, ..., yhatN
@@ -80,8 +83,8 @@ class OutputFormatter:
 
         for step in range(1, n_forecast + 1):
             yhat_col = f"yhat{step}"
-            yhat_lower_col = f"yhat_lower{step}"
-            yhat_upper_col = f"yhat_upper{step}"
+            yhat_lower_col = f"yhat{step} 16.0%"
+            yhat_upper_col = f"yhat{step} 84.0%"
 
             # Skip if this yhat column doesn't exist
             if yhat_col not in df.columns:
@@ -98,7 +101,9 @@ class OutputFormatter:
                 # Calculate target timestamp
                 forecast_ts = row["ds"]
                 freq_td = pd.to_timedelta(freq)
-                target_ts = forecast_ts + (step * freq_td)
+
+                # rolling back window
+                issue_time = forecast_ts - (step * freq_td)
 
                 # Extract uncertainty bounds if available
                 yhat_lower = row[yhat_lower_col] if yhat_lower_col in df.columns else np.nan
@@ -106,11 +111,13 @@ class OutputFormatter:
 
                 results.append(
                     {
-                        "ds": target_ts,
+                        "ds": forecast_ts,
                         "yhat": yhat_val,
                         "yhat_lower": yhat_lower,
                         "yhat_upper": yhat_upper,
                         "step": step,
+                        "lead_time": (step * freq_td).total_seconds() / 3600.0,
+                        "issue_time": issue_time,
                     }
                 )
 
@@ -120,7 +127,7 @@ class OutputFormatter:
         result_df = pd.DataFrame(results)
 
         # Reorder columns
-        cols = ["ds", "yhat", "yhat_lower", "yhat_upper", "step"]
+        cols = ["ds", "yhat", "yhat_lower", "yhat_upper", "step", "lead_time", "issue_time"]
         result_df = result_df[cols]
 
         return result_df

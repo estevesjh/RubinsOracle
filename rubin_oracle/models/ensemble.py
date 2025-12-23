@@ -175,7 +175,7 @@ class EnsembleForecaster(ValidationMixin):
         print("=" * 60)
         print(f"Original signal variance:    {original_var:.4f}")
         print(f"Residual variance:           {residual_var:.6f}")
-        print(f"Variance recovered:          {recovered_var_ratio*100:.2f}%")
+        print(f"Variance recovered:          {recovered_var_ratio * 100:.2f}%")
         print(f"Mean bias:                   {mean_bias:.4f}°C")
         print(f"Max absolute residual:       {max_abs_residual:.4f}°C")
         print("-" * 60)
@@ -192,7 +192,7 @@ class EnsembleForecaster(ValidationMixin):
         if np.abs(mean_bias) > 0.01:
             warnings.warn(f"Decomposition bias detected: {mean_bias:.4f}°C", stacklevel=2)
         if recovered_var_ratio < 0.99:
-            warnings.warn(f"Low variance recovery: {recovered_var_ratio*100:.1f}%", stacklevel=2)
+            warnings.warn(f"Low variance recovery: {recovered_var_ratio * 100:.1f}%", stacklevel=2)
 
         return {"mean_bias": mean_bias, "variance_recovered": recovered_var_ratio}
 
@@ -225,11 +225,9 @@ class EnsembleForecaster(ValidationMixin):
             # Determine frequency based on resolution/downsampling
             freq = comp_config.downsample_to or comp_config.resolution
 
-            # Use component's lag_days if specified, otherwise use ensemble's lag_days_max
+            # Use component's lag_days if specified, otherwise use ensemble's lag_days
             lag_days = (
-                comp_config.lag_days
-                if comp_config.lag_days is not None
-                else self.config.lag_days_max
+                comp_config.lag_days if comp_config.lag_days is not None else self.config.lag_days
             )
 
             config = ProphetConfig(
@@ -270,14 +268,12 @@ class EnsembleForecaster(ValidationMixin):
             else:
                 freq = comp_config.downsample_to or comp_config.resolution
 
-            # Use component's lag_days if specified, otherwise use ensemble's lag_days_max
+            # Use component's lag_days if specified, otherwise use ensemble's lag_days
             lag_days = (
-                comp_config.lag_days
-                if comp_config.lag_days is not None
-                else self.config.lag_days_max
+                comp_config.lag_days if comp_config.lag_days is not None else self.config.lag_days
             )
 
-            # All components forecast the same time span (n_forecast days)
+            # All components forecast the same time span (n_forecast steps)
             # Each converts internally to samples based on its resolution
             config = NeuralProphetConfig(
                 lag_days=lag_days,
@@ -291,7 +287,6 @@ class EnsembleForecaster(ValidationMixin):
                 epochs=comp_config.epochs,
                 learning_rate=comp_config.learning_rate,
                 n_changepoints=comp_config.n_changepoints,
-                custom_seasonalities=custom_seasonalities,
                 # Disable early stopping and validation for ensemble components
                 early_stopping=False,
                 valid_pct=0.0,
@@ -424,7 +419,9 @@ class EnsembleForecaster(ValidationMixin):
 
         # Fit each component
         for i, comp_config in enumerate(self.config.components):
-            print(f"\n[{i+1}/{len(self.config.components)}] Fitting component: {comp_config.name}")
+            print(
+                f"\n[{i + 1}/{len(self.config.components)}] Fitting component: {comp_config.name}"
+            )
             print(f"  Model type: {comp_config.model_type}")
             print(f"  Bands: {comp_config.band_indices}")
             print(f"  Lag days: {comp_config.lag_days}")
@@ -474,40 +471,32 @@ class EnsembleForecaster(ValidationMixin):
             # Get component data
             df_comp = self._get_component_data(df, df_decomposed, comp_config)
 
-            # Get in-sample predictions
+            # Get in-sample predictions (fitted values)
             try:
-                if hasattr(model, "model_") and model.model_ is not None:
-                    # Prophet: get fitted values
-                    if comp_config.model_type == "prophet":
-                        fitted = model.model_.predict(model.model_.history)
-                        comp_yhat = fitted["yhat"].values.astype(float)
+                if hasattr(model, "fitted"):
+                    fc = model.fitted()
+                    # Prophet returns "yhat", NeuralProphet returns "yhat1", "yhat2", etc
+                    if "yhat" in fc.columns:
+                        # Prophet case
+                        comp_yhat = fc["yhat"].values.astype(float)
+                    elif "yhat1" in fc.columns:
+                        # NeuralProphet case: use 1-step ahead predictions
+                        comp_yhat = fc["yhat1"].values.astype(float)
                     else:
-                        # NeuralProphet - use stored _fit_df for predictions
-                        if hasattr(model, "_fit_df") and model._fit_df is not None:
-                            fc = model.predict(model._fit_df, periods=0)
-                        else:
-                            fc = model.predict(df_comp, periods=0)
-                        # Get yhat1 (1-step ahead fitted values)
-                        if "yhat1" in fc.columns:
-                            comp_yhat = fc["yhat1"].values.astype(float)
-                        elif "yhat" in fc.columns:
-                            comp_yhat = fc["yhat"].values.astype(float)
-                        else:
-                            yhat_cols = [
-                                c for c in fc.columns if c.startswith("yhat") and c[4:].isdigit()
-                            ]
-                            comp_yhat = (
-                                fc[yhat_cols[0]].values.astype(float)
-                                if yhat_cols
-                                else df_comp["y"].values.astype(float)
-                            )
+                        # Fallback: try first yhat* column
+                        yhat_cols = [c for c in fc.columns if c.startswith("yhat")]
+                        comp_yhat = (
+                            fc[yhat_cols[0]].values.astype(float)
+                            if yhat_cols
+                            else np.zeros(len(df_comp))
+                        )
                 else:
-                    comp_yhat = df_comp["y"].values.astype(float)
+                    comp_yhat = np.zeros(len(df_comp))
             except Exception as e:
                 warnings.warn(
-                    f"Could not get predictions for {comp_config.name}: {e}", stacklevel=2
+                    f"Could not get fitted predictions for {comp_config.name}: {e}", stacklevel=2
                 )
-                comp_yhat = df_comp["y"].values.astype(float)
+                comp_yhat = np.zeros(len(df_comp))
 
             # Upsample if needed (keep NaN - don't replace with 0)
             if comp_config.downsample_to:
@@ -747,25 +736,21 @@ class EnsembleForecaster(ValidationMixin):
             if not hasattr(model, "_fit_df") or model._fit_df is None:
                 continue
 
-            # Get in-sample predictions from component
-            if comp_config.model_type == "prophet":
-                # Prophet: predict on training data
-                fit_pred = model.model_.predict(model._fit_df)
+            # Get in-sample predictions from component using fitted() method
+            fit_pred = model.fitted()
+
+            # Prophet returns "yhat", NeuralProphet returns "yhat1", "yhat2", etc
+            if "yhat" in fit_pred.columns:
+                # Prophet case
                 comp_yhat = fit_pred["yhat"].values
-                comp_ds = pd.to_datetime(fit_pred["ds"])
+            elif "yhat1" in fit_pred.columns:
+                # NeuralProphet case: use 1-step ahead predictions
+                comp_yhat = fit_pred["yhat1"].values
             else:
-                # NeuralProphet: use yhat1 (1-step ahead prediction)
-                fit_pred = model.predict(model._fit_df, periods=0)
-                if "yhat1" in fit_pred.columns:
-                    comp_yhat = fit_pred["yhat1"].values
-                elif "yhat" in fit_pred.columns:
-                    comp_yhat = fit_pred["yhat"].values
-                else:
-                    yhat_cols = [c for c in fit_pred.columns if c.startswith("yhat")]
-                    comp_yhat = (
-                        fit_pred[yhat_cols[0]].values if yhat_cols else np.zeros(len(fit_pred))
-                    )
-                comp_ds = pd.to_datetime(fit_pred["ds"])
+                # Fallback: try first yhat* column
+                yhat_cols = [c for c in fit_pred.columns if c.startswith("yhat")]
+                comp_yhat = fit_pred[yhat_cols[0]].values if yhat_cols else np.zeros(len(fit_pred))
+            comp_ds = pd.to_datetime(fit_pred["ds"])
 
             # Ensure comp_ds is timezone-naive for merging
             if comp_ds.dt.tz is not None:
@@ -794,18 +779,18 @@ class EnsembleForecaster(ValidationMixin):
 
         return pd.DataFrame({"ds": result_ds, "yhat": yhat_combined})
 
-    def predict(self, df: pd.DataFrame | None = None, periods: int | None = None) -> pd.DataFrame:
-        """Generate ensemble forecast.
+    def forecast(self, df: pd.DataFrame | None = None, periods: int | None = None) -> pd.DataFrame:
+        """Generate ensemble forecast (orchestrator method).
 
-        1. Decompose input history (if provided)
-        2. Generate forecasts from each component
-        3. Upsample if needed
-        4. Combine forecasts
-        5. Apply post-processing
+        This is the public forecasting method that handles:
+        1. Data preparation and decomposition
+        2. Component forecast generation
+        3. Forecast combination
+        4. Post-processing
 
         Args:
             df: History dataframe (required for NeuralProphet components)
-            periods: Number of periods to forecast
+            periods: Number of periods to forecast in days. If None, uses config.n_forecast
 
         Returns:
             DataFrame with 'ds', 'yhat', and step columns
@@ -813,10 +798,15 @@ class EnsembleForecaster(ValidationMixin):
         if not self._is_fitted:
             raise RuntimeError("Model must be fitted before prediction")
 
-        periods = periods or self.config.n_forecast
-        forecasts = []
+        # Use config default if periods not provided
+        if periods is None:
+            periods = self.config.n_forecast
 
-        # Decompose history if provided
+        # Convert periods from days to samples
+        periods_samples = FrequencyConverter.days_to_samples(periods, self.config.output_freq)
+
+        # Prepare data: decompose and get component-specific data
+        forecasts = []
         df_decomposed = None
         if df is not None:
             df_decomposed = self._decomposer.decompose(df)
@@ -828,7 +818,7 @@ class EnsembleForecaster(ValidationMixin):
 
         # Generate forecasts from each component
         for comp_config, model in self._components:
-            # Get component-specific data
+            # Get component-specific prepared data
             if df_decomposed is not None:
                 df_comp = self._get_component_data(df, df_decomposed, comp_config)
             else:
@@ -838,55 +828,29 @@ class EnsembleForecaster(ValidationMixin):
             if comp_config.downsample_to:
                 from_per_hour = self._parse_freq_per_hour(comp_config.downsample_to)
                 to_per_hour = self._freq_per_hour
-                comp_periods = int(np.ceil(periods * from_per_hour / to_per_hour)) + 1
-            else:
-                comp_periods = periods
-
-            # Generate forecast
-            fc = model.predict(df_comp, periods=comp_periods)
-
-            # Extract yhat values
-            if "yhat" in fc.columns:
-                # Prophet format: simple yhat column
-                yhat = fc["yhat"].values
-            else:
-                # NeuralProphet multi-step format: yhat1, yhat2, ..., yhatN
-                # For forecasting, extract multi-step values from the LAST valid row
-                yhat_cols = sorted(
-                    [c for c in fc.columns if c.startswith("yhat") and c[4:].isdigit()],
-                    key=lambda x: int(x[4:]),
+                comp_periods_samples = (
+                    int(np.ceil(periods_samples * from_per_hour / to_per_hour)) + 1
                 )
-                if not yhat_cols:
-                    raise ValueError(f"No yhat column found in forecast from {comp_config.name}")
+            else:
+                comp_periods_samples = periods_samples
 
-                # Find the last row with valid yhat1 (the forecast origin)
-                valid_mask = fc["yhat1"].notna()
-                if valid_mask.any():
-                    last_valid_idx = valid_mask[valid_mask].index[-1]
-                    # Extract yhat1, yhat2, ..., yhatN from this row as the multi-step forecast
-                    yhat = np.array(
-                        [fc.loc[last_valid_idx, col] for col in yhat_cols[:comp_periods]]
-                    )
-                else:
-                    # Fallback: use last non-NaN values from each column
-                    yhat = np.array(
-                        [
-                            fc[col].dropna().iloc[-1] if fc[col].notna().any() else np.nan
-                            for col in yhat_cols[:comp_periods]
-                        ]
-                    )
+            # Generate forecast using component's forecast method
+            fc = model.forecast(df_comp, periods=comp_periods_samples)
+
+            # Extract yhat values from standardized output
+            yhat = self._extract_yhat_from_forecast(fc, comp_periods_samples, comp_config)
 
             # Upsample if needed
             if comp_config.downsample_to:
                 yhat = self._upsample_forecast(
-                    yhat, comp_config.downsample_to, self.config.output_freq, periods
+                    yhat, comp_config.downsample_to, self.config.output_freq, periods_samples
                 )
 
             # Ensure correct length
-            yhat = yhat[:periods]
-            if len(yhat) < periods:
+            yhat = yhat[:periods_samples]
+            if len(yhat) < periods_samples:
                 # Pad with last value if needed
-                yhat = np.pad(yhat, (0, periods - len(yhat)), mode="edge")
+                yhat = np.pad(yhat, (0, periods_samples - len(yhat)), mode="edge")
 
             forecasts.append(yhat)
 
@@ -902,7 +866,55 @@ class EnsembleForecaster(ValidationMixin):
             )
 
         # Build output DataFrame
-        return self._build_output(df, yhat_combined, periods)
+        return self._build_output(df, yhat_combined, periods_samples)
+
+    def _extract_yhat_from_forecast(
+        self, fc: pd.DataFrame, periods: int, comp_config: ComponentConfig
+    ) -> np.ndarray:
+        """Extract yhat values from component forecast output.
+
+        Handles both standardized formats from ProphetForecaster and NeuralProphetForecaster.
+
+        Args:
+            fc: Component forecast DataFrame
+            periods: Number of forecast periods
+            comp_config: Component configuration
+
+        Returns:
+            Array of yhat values
+        """
+        if "yhat" in fc.columns:
+            # Prophet format: simple yhat column
+            return fc["yhat"].values
+        else:
+            # NeuralProphet multi-step format: yhat1, yhat2, ..., yhatN
+            # For forecasting, extract multi-step values from the LAST valid row
+            yhat_cols = sorted(
+                [c for c in fc.columns if c.startswith("yhat") and c[4:].isdigit()],
+                key=lambda x: int(x[4:]),
+            )
+            if not yhat_cols:
+                raise ValueError(f"No yhat column found in forecast from {comp_config.name}")
+
+            # Find the last row with valid yhat1 (the forecast origin)
+            valid_mask = fc["yhat1"].notna()
+            if valid_mask.any():
+                last_valid_idx = valid_mask[valid_mask].index[-1]
+                # Extract yhat1, yhat2, ..., yhatN from this row as the multi-step forecast
+                yhat = np.array([fc.loc[last_valid_idx, col] for col in yhat_cols[:periods]])
+            else:
+                # Fallback: use last non-NaN values from each column
+                yhat = np.array(
+                    [
+                        fc[col].dropna().iloc[-1] if fc[col].notna().any() else np.nan
+                        for col in yhat_cols[:periods]
+                    ]
+                )
+            return yhat
+
+    def predict(self, df: pd.DataFrame | None = None, periods: int | None = None) -> pd.DataFrame:
+        """Simple wrapper for backward compatibility (deprecated - use forecast instead)."""
+        return self.forecast(df=df, periods=periods)
 
     def _build_output(
         self, df: pd.DataFrame | None, yhat: np.ndarray, periods: int

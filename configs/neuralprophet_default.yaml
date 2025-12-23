@@ -1,6 +1,6 @@
 name: neural_prophet
-lag_days: 192
-n_forecast: 96
+lag_days: 7
+n_forecast: 1
 model_dir: outputs/models/default
 
 # Data frequency
@@ -30,15 +30,14 @@ trend_reg: 1.0
 
 # Training
 epochs: 500
-batch_size: 128
-learning_rate: 0.003
+batch_size: 64
+learning_rate: 0.1
 loss_func: SmoothL1Loss
 optimizer: AdamW
 
 # Early stopping
-early_stopping: true
-valid_pct: 0.1
-patience: 10
+early_stopping: false
+valid_pct: 0.0
 
 # Uncertainty
 quantiles:

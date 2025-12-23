@@ -154,3 +154,79 @@ class FrequencyConverter:
         """
         samples_per_hour = FrequencyConverter.freq_to_samples_per_hour(freq)
         return samples / samples_per_hour
+
+    @staticmethod
+    def lead_time_to_step(lead_time: float, freq: str, n_forecast: int) -> int:
+        """Convert lead time in hours to the corresponding step number.
+
+        Args:
+            lead_time: Forecast horizon in hours (e.g., 12.0, 24.0)
+            freq: Frequency string (e.g., '15min', 'H')
+            n_forecast: Maximum number of forecast steps
+
+        Returns:
+            Step number (e.g., 4 for yhat4)
+
+        Raises:
+            ValueError: If lead_time is invalid or exceeds n_forecast steps
+        """
+        step = FrequencyConverter.hours_to_samples(lead_time, freq)
+
+        if step < 1:
+            raise ValueError(
+                f"Lead time '{lead_time}' hours is less than frequency '{freq}'. "
+                f"Lead time must be >= frequency."
+            )
+
+        if step > n_forecast:
+            raise ValueError(
+                f"Lead time '{lead_time}' hours corresponds to step {step}, "
+                f"but n_forecast is {n_forecast}."
+            )
+
+        return step
+
+
+class SampleConverter:
+    """Caches frequency-based sample conversions for a given configuration.
+
+    Avoids repeated computation of lag_samples and n_forecast_samples
+    by caching values on initialization.
+
+    Attributes:
+        freq: Frequency string
+        lag_days: Lag window in days
+        n_forecast: Forecast horizon in days
+        lag_samples: Cached lag in samples
+        n_forecast_samples: Cached forecast horizon in samples
+        freq_td: Cached frequency as timedelta
+    """
+
+    def __init__(self, freq: str, lag_days: float, n_forecast: float):
+        """Initialize with frequency and time parameters.
+
+        Args:
+            freq: Frequency string (e.g., '15min', '1h')
+            lag_days: Lag window in days
+            n_forecast: Forecast horizon in days
+        """
+        self.freq = freq
+        self.lag_days = lag_days
+        self.n_forecast = n_forecast
+
+        # Cache computed values
+        self.freq_td = FrequencyConverter.freq_to_timedelta(freq)
+        self.lag_samples = FrequencyConverter.days_to_samples(lag_days, freq)
+        self.n_forecast_samples = FrequencyConverter.days_to_samples(n_forecast, freq)
+        self.steps_per_day = FrequencyConverter.freq_to_samples_per_day(freq)
+
+    def lead_time_to_step(self, lead_time: float) -> int:
+        """Convert lead time in hours to step number using cached n_forecast_samples.
+
+        Args:
+            lead_time: Forecast horizon in hours
+
+        Returns:
+            Step number
+        """
+        return FrequencyConverter.lead_time_to_step(lead_time, self.freq, self.n_forecast_samples)

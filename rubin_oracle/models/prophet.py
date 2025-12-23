@@ -212,7 +212,7 @@ class ProphetForecaster(ValidationMixin):
         """Generate future forecasts starting from end of training data.
 
         Args:
-            periods: Number of periods to forecast. If None, uses config.n_forecast.
+            periods: Number of periods to forecast in days. If None, uses config.n_forecast.
 
         Returns:
             DataFrame with columns:
@@ -230,7 +230,7 @@ class ProphetForecaster(ValidationMixin):
         if periods is None:
             periods = self.config.n_forecast
 
-        # Convert periods from days to samples based on frequency
+        # Convert periods from days to samples
         periods_samples = FrequencyConverter.days_to_samples(periods, self.config.freq)
 
         # Create future dataframe and predict

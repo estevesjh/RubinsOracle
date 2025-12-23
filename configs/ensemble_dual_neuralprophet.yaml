@@ -6,7 +6,7 @@
 
 name: ensemble
 lag_days: 60
-n_forecast: 48
+n_forecast: 2
 freq: 15min
 
 # 5-band decomposition (freq as observations per day: 96 = 24 hours / 15min)
@@ -22,12 +22,13 @@ decomposer:
     - [25.00, 60.00] # Band 4: Monthly (25-60d)
   filter_type: savgol
   savgol_polyorder: 3
-  savgol_butter_cleanup: false
   edge_method: reflect
-  edge_pad_periods: 2.0
-  include_residual: false
+  edge_pad_periods: 4.0
+  pad_method: none
   nan_fill: periodic
   nan_fill_period: 1.0
+  nan_fill_max_gap: 7
+  include_residual: false
 
 # Component models
 components:

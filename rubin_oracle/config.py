@@ -29,12 +29,16 @@ class DecomposerConfig(BaseModel):
         BandpassDecomposer parameters:
         period_pairs: List of (low, high) period pairs in days
         filter_type: Filter type ('savgol' or 'butterworth')
-        edge_method: Edge handling method
-        edge_pad_periods: Padding for edge mitigation
+        edge_method: Pre-filter edge padding method
+        edge_pad_periods: Pre-filter padding periods
+        pad_method: Post-filter edge correction method
+        pad_num_periods: Number of periods to replace at each edge
+        pad_max_periods: Max pad size in periods
         nan_fill: NaN filling method
         nan_fill_period: Period for periodic NaN filling
-        use_edge_weighting: Apply edge weighting
+        nan_fill_max_gap: Max gap size for periodic fill
         butter_order: Butterworth filter order
+        savgol_polyorder: Savitzky-Golay polynomial order
 
         RubinVMDDecomposer parameters:
         alpha: VMD bandwidth constraint
@@ -66,25 +70,44 @@ class DecomposerConfig(BaseModel):
         default="reflect", description="Edge handling method for bandpass"
     )
     edge_pad_periods: float = Field(
-        default=2.0, ge=0.0, description="Padding periods for edge mitigation"
+        default=4.0, ge=0.0, description="Pre-filter padding periods for edge mitigation"
     )
+
+    # Post-filter edge correction (pad_*)
+    pad_method: Literal["none", "periodic", "stl", "arima"] = Field(
+        default="none", description="Post-filter edge correction method"
+    )
+    pad_num_periods: int = Field(
+        default=1, ge=1, description="Number of periods to replace at each edge"
+    )
+    pad_max_periods: float = Field(
+        default=2.0, gt=0.0, description="Max pad size in periods (caps low-freq bands)"
+    )
+    pad_target_periods: dict[int, int] | None = Field(
+        default=None, description="Dict mapping band_idx to exact period_obs for STL/ARIMA"
+    )
+    pad_arima_order: tuple[int, int, int] = Field(
+        default=(2, 0, 2), description="ARIMA order (p, d, q) for arima method"
+    )
+    pad_bands: list[int] | None = Field(
+        default=None, description="Which bands to apply padding to (None = all)"
+    )
+
+    # NaN handling
     nan_fill: Literal["periodic", "linear", "ffill"] = Field(
         default="periodic", description="NaN filling method"
     )
     nan_fill_period: float = Field(
         default=1.0, gt=0.0, description="Period in days for periodic NaN filling"
     )
-    use_edge_weighting: bool = Field(
-        default=False, description="Apply edge weighting after filtering"
+    nan_fill_max_gap: int = Field(
+        default=7, ge=1, description="Max gap size for periodic NaN fill (in periods)"
     )
-    butter_order: int = Field(default=4, ge=1, description="Butterworth filter order")
 
-    # Savitzky-Golay specific parameters
+    # Filter parameters
+    butter_order: int = Field(default=4, ge=1, description="Butterworth filter order")
     savgol_polyorder: int = Field(
         default=3, ge=1, description="Polynomial order for Savitzky-Golay filter"
-    )
-    savgol_butter_cleanup: bool = Field(
-        default=True, description="Apply Butterworth bandpass after Savitzky-Golay for cleanup"
     )
 
     # RubinVMDDecomposer parameters
@@ -274,6 +297,13 @@ class NeuralProphetConfig(BaseForecasterConfig):
     # Data handling
     drop_missing: bool = True
     impute_missing: bool = True
+
+    # Custom seasonality periods (same format as ProphetConfig)
+    custom_seasonalities: list[dict] | None = Field(
+        default=None,
+        description="List of custom seasonality definitions: "
+        "[{name, period, fourier_order, condition_name (optional)}]",
+    )
 
 
 # ============================================================================

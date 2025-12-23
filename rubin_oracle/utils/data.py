@@ -6,6 +6,7 @@ time series data for forecasting models.
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 
@@ -39,39 +40,39 @@ def validate_input(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     # Check required columns - allow tempMean as fallback for y
-    if 'ds' not in df.columns:
+    if "ds" not in df.columns:
         raise ValueError("Missing required column: 'ds'")
 
-    if 'y' not in df.columns and 'tempMean' not in df.columns:
+    if "y" not in df.columns and "tempMean" not in df.columns:
         raise ValueError("Missing required column: 'y' or 'tempMean'")
 
     # Map tempMean to y if needed
-    if 'y' not in df.columns and 'tempMean' in df.columns:
-        df['y'] = df['tempMean']
+    if "y" not in df.columns and "tempMean" in df.columns:
+        df["y"] = df["tempMean"]
 
     # Ensure 'ds' is datetime
-    if not pd.api.types.is_datetime64_any_dtype(df['ds']):
+    if not pd.api.types.is_datetime64_any_dtype(df["ds"]):
         try:
-            df['ds'] = pd.to_datetime(df['ds'])
+            df["ds"] = pd.to_datetime(df["ds"])
         except Exception as e:
-            raise ValueError(f"Could not convert 'ds' column to datetime: {e}")
+            raise ValueError(f"Could not convert 'ds' column to datetime: {e}") from e
 
     # Ensure 'y' is numeric
-    if not pd.api.types.is_numeric_dtype(df['y']):
+    if not pd.api.types.is_numeric_dtype(df["y"]):
         try:
-            df['y'] = pd.to_numeric(df['y'])
+            df["y"] = pd.to_numeric(df["y"])
         except Exception as e:
-            raise ValueError(f"Could not convert 'y' column to numeric: {e}")
+            raise ValueError(f"Could not convert 'y' column to numeric: {e}") from e
 
     # Check for all NaN values in target
-    if df['y'].isna().all():
+    if df["y"].isna().all():
         raise ValueError("Target column 'y' contains only NaN values")
 
     # Sort by datetime
-    df = df.sort_values('ds').reset_index(drop=True)
+    df = df.sort_values("ds").reset_index(drop=True)
 
     # Check for duplicate timestamps
-    n_duplicates = df['ds'].duplicated().sum()
+    n_duplicates = df["ds"].duplicated().sum()
     if n_duplicates > 0:
         raise ValueError(
             f"Found {n_duplicates} duplicate timestamps. "
@@ -83,8 +84,8 @@ def validate_input(df: pd.DataFrame) -> pd.DataFrame:
 
 def compute_temp_mean(
     df: pd.DataFrame,
-    temp_max_col: str = 'tempMax',
-    temp_min_col: str = 'tempMin',
+    temp_max_col: str = "tempMax",
+    temp_min_col: str = "tempMin",
 ) -> pd.DataFrame:
     """Compute temperature mean from tempMax and tempMin.
 
@@ -116,16 +117,16 @@ def compute_temp_mean(
         )
 
     df = df.copy()
-    df['y'] = (df[temp_max_col] + df[temp_min_col]) / 2.0
+    df["y"] = (df[temp_max_col] + df[temp_min_col]) / 2.0
 
     return df
 
 
 def prepare_regular_frequency(
     df: pd.DataFrame,
-    freq: str = 'h',
+    freq: str = "h",
     interpolate: bool = True,
-    method: str = 'time',
+    method: str = "time",
 ) -> pd.DataFrame:
     """Prepare time series with regular frequency.
 
@@ -155,18 +156,18 @@ def prepare_regular_frequency(
     df = validate_input(df)
 
     # Set datetime as index temporarily
-    df = df.set_index('ds')
+    df = df.set_index("ds")
 
     # Sort index and drop duplicates
     df = df.sort_index()
-    df = df[~df.index.duplicated(keep='first')]
+    df = df[~df.index.duplicated(keep="first")]
 
     # Build regular frequency grid
     full_idx = pd.date_range(
         start=df.index.min(),
         end=df.index.max(),
         freq=freq,
-        name='ds',
+        name="ds",
     )
 
     # Reindex to regular grid
@@ -174,14 +175,14 @@ def prepare_regular_frequency(
 
     # Interpolate if requested
     if interpolate:
-        if method in ['time', 'linear']:
-            df_regular['y'] = df_regular['y'].interpolate(method=method)
-        elif method == 'ffill':
-            df_regular['y'] = df_regular['y'].ffill()
-        elif method == 'bfill':
-            df_regular['y'] = df_regular['y'].bfill()
-        elif method == 'nearest':
-            df_regular['y'] = df_regular['y'].interpolate(method='nearest')
+        if method in ["time", "linear"]:
+            df_regular["y"] = df_regular["y"].interpolate(method=method)
+        elif method == "ffill":
+            df_regular["y"] = df_regular["y"].ffill()
+        elif method == "bfill":
+            df_regular["y"] = df_regular["y"].bfill()
+        elif method == "nearest":
+            df_regular["y"] = df_regular["y"].interpolate(method="nearest")
 
     # Reset index to get 'ds' column back
     df_regular = df_regular.reset_index()
@@ -208,14 +209,14 @@ def check_missing_values(df: pd.DataFrame) -> dict[str, int | float]:
     """
     df = validate_input(df)
 
-    n_missing = df['y'].isna().sum()
+    n_missing = df["y"].isna().sum()
     n_total = len(df)
     pct_missing = (n_missing / n_total * 100) if n_total > 0 else 0.0
 
     return {
-        'n_missing': int(n_missing),
-        'pct_missing': float(pct_missing),
-        'has_missing': bool(n_missing > 0),
+        "n_missing": int(n_missing),
+        "pct_missing": float(pct_missing),
+        "has_missing": bool(n_missing > 0),
     }
 
 
@@ -239,6 +240,34 @@ def get_frequency(df: pd.DataFrame) -> str | None:
         return None
 
     # Try to infer frequency
-    freq = pd.infer_freq(df['ds'])
+    freq = pd.infer_freq(df["ds"])
 
     return freq
+
+
+def add_time_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Add cyclic time features (hour of day, day of year).
+
+    Uses sin/cos encoding to preserve circular nature of time.
+
+    Args:
+        df: DataFrame with 'ds' column
+
+    Returns:
+        DataFrame with added time feature columns:
+            - hour_sin, hour_cos: Hour of day (0-23) encoded cyclically
+            - doy_sin, doy_cos: Day of year (1-366) encoded cyclically
+    """
+    df = df.copy()
+
+    # Hour of day (0-23) -> cyclic encoding
+    hour = df["ds"].dt.hour + df["ds"].dt.minute / 60.0
+    df["hour_sin"] = np.sin(2 * np.pi * hour / 24.0)
+    df["hour_cos"] = np.cos(2 * np.pi * hour / 24.0)
+
+    # Day of year (1-366) -> cyclic encoding
+    doy = df["ds"].dt.dayofyear
+    df["doy_sin"] = np.sin(2 * np.pi * doy / 365.25)
+    df["doy_cos"] = np.cos(2 * np.pi * doy / 365.25)
+
+    return df

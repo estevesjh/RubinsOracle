@@ -1,6 +1,6 @@
 name: neural_prophet
-lag_days: 96
-n_forecast: 96
+lag_days: 1
+n_forecast: 1
 model_dir: outputs/models/savgol_base
 
 # Data frequency
@@ -10,7 +10,7 @@ freq_per_day: 96
 # Seasonality
 yearly_seasonality: false
 weekly_seasonality: false
-daily_seasonality: false
+daily_seasonality: true
 seasonality_mode: additive
 
 # Trend
@@ -28,30 +28,30 @@ decomposer:
 
   # Period bands in days (from original SignalDecomposer windows)
   # Original used cascade lowpass filters with these approximate periods:
-  # p0: ~0.05d, day: ~1.4d, 3day: ~2.4d, 6day: ~5d, 11day: ~11d, 14day: ~17d, 28day: ~28d, 56day: ~57d
   period_pairs:
-    - [0.05, 1.40]    # y_p0: Sub-daily to daily (p0_trend - day_trend)
-    - [2.40, 5.00]    # y_p1: 3-day to 6-day (3day_trend - 6day_trend)
-    - [5.00, 11.00]   # y_p2: 6-day to 11-day (6day_trend - 11day_trend)
-    - [11.00, 17.00]  # y_p3: 11-day to 17-day (11day_trend - 14day_trend)
-    - [17.00, 28.00]  # y_p4: 17-day to 28-day (14day_trend - 28day_trend)
-    - [28.00, 57.00]  # y_p5: 28-day to 57-day trend (28day_trend - 56day_trend)
+    - [0.10, 0.80]   # Band 0: Sub-daily (< 17h)
+    - [0.80, 1.5]   # Band 1: Daily (17h - 4d)
+    - [1.5, 4.00]   # Band 2: Weekly (4-11d)
+    - [4.00, 25.00]  # Band 3: Bi-weekly (11-25d)
+    - [25.00, 60.00] # Band 4: Monthly (25-60d)
 
   # Filter settings - use Savitzky-Golay to match original
   filter_type: savgol
   savgol_polyorder: 3
-  savgol_butter_cleanup: false
 
-  # Edge handling
+  # Pre-filter edge padding
   edge_method: reflect
-  edge_pad_periods: 2.0
-  use_edge_weighting: false
+  edge_pad_periods: 4.0
 
-  include_residual: false
+  # Post-filter edge correction (optional)
+  pad_method: none
 
   # NaN handling
   nan_fill: periodic
   nan_fill_period: 1.0
+  nan_fill_max_gap: 7
+
+  include_residual: false
 
 # AR configuration
 ar_layers: [48, 24, 48]

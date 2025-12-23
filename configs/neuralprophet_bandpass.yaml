@@ -1,6 +1,6 @@
 name: neural_prophet
-lag_days: 192
-n_forecast: 96
+lag_days: 2
+n_forecast: 1
 model_dir: outputs/models/bandpass
 
 # Data frequency
@@ -38,16 +38,19 @@ decomposer:
   filter_type: butterworth
   butter_order: 4
 
-  # Edge handling
+  # Pre-filter edge padding
   edge_method: reflect
-  edge_pad_periods: 2.0
-  use_edge_weighting: false
+  edge_pad_periods: 4.0
 
-  include_residual: false  # Include residual as feature - default: false
+  # Post-filter edge correction (optional)
+  pad_method: none
 
   # NaN handling
   nan_fill: periodic
   nan_fill_period: 1.0
+  nan_fill_max_gap: 7
+
+  include_residual: false  # Include residual as feature - default: false
 
 # AR configuration
 ar_layers: [48, 24, 48]
