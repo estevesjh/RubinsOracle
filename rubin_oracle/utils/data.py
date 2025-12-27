@@ -6,8 +6,55 @@ time series data for forecasting models.
 
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import pandas as pd
+
+
+def normalize_frequency(freq: str) -> str:
+    """Normalize frequency string to valid pandas offset alias.
+
+    Handles various user-friendly formats and converts them to pandas-compatible strings.
+
+    Args:
+        freq: Frequency string in various formats
+
+    Returns:
+        Normalized pandas-compatible frequency string
+
+    Examples:
+        >>> normalize_frequency("1hour")
+        '1h'
+        >>> normalize_frequency("1 hour")
+        '1h'
+        >>> normalize_frequency("30min")
+        '30min'
+        >>> normalize_frequency("15 minutes")
+        '15min'
+    """
+    if not isinstance(freq, str):
+        return freq
+
+    # Lowercase and strip whitespace
+    freq = freq.lower().strip()
+
+    # Remove spaces
+    freq = freq.replace(" ", "")
+
+    # Handle hour variants
+    freq = re.sub(r"(\d+)?hours?$", lambda m: f"{m.group(1) or '1'}h", freq)
+
+    # Handle minute variants
+    freq = re.sub(r"(\d+)?minutes?$", lambda m: f"{m.group(1) or '1'}min", freq)
+
+    # Handle second variants
+    freq = re.sub(r"(\d+)?seconds?$", lambda m: f"{m.group(1) or '1'}s", freq)
+
+    # Handle day variants
+    freq = re.sub(r"(\d+)?days?$", lambda m: f"{m.group(1) or '1'}D", freq)
+
+    return freq
 
 
 def validate_input(df: pd.DataFrame) -> pd.DataFrame:
@@ -154,6 +201,9 @@ def prepare_regular_frequency(
     """
     # Validate input first
     df = validate_input(df)
+
+    # Normalize frequency string
+    freq = normalize_frequency(freq)
 
     # Set datetime as index temporarily
     df = df.set_index("ds")

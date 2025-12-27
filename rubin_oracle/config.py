@@ -93,6 +93,17 @@ class DecomposerConfig(BaseModel):
         default=None, description="Which bands to apply padding to (None = all)"
     )
 
+    # Signal extension (for SignalDecomposer)
+    extension_days: float = Field(
+        default=2.0, ge=0.0, description="Days to extend forward for edge effect mitigation"
+    )
+    extension_model_type: Literal["prophet"] = Field(
+        default="prophet", description="Model type for signal extension"
+    )
+    history_buffer_days: float = Field(
+        default=14.0, ge=1.0, description="Minimum days of history to keep for filter continuity"
+    )
+
     # NaN handling
     nan_fill: Literal["periodic", "linear", "ffill"] = Field(
         default="periodic", description="NaN filling method"
@@ -139,8 +150,8 @@ class BaseForecasterConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     name: str
-    lag_days: int = Field(default=48, ge=1)
-    n_forecast: int = Field(default=48, ge=1)
+    lag_days: float = Field(default=1, ge=0)
+    n_forecast: float = Field(default=1, ge=1)
 
     # Data frequency
     freq: str = Field(default="h", description="Pandas frequency string (e.g., 'h', '15min', 'D')")
@@ -361,7 +372,7 @@ class ComponentConfig(BaseModel):
     )
 
     # Training window
-    lag_days: int = Field(default=7, ge=1, description="Days of history for this component")
+    lag_days: float = Field(default=7, ge=0, description="Days of history for this component")
 
     # Seasonalities (for both Prophet and NeuralProphet)
     seasonalities: list[SeasonalityConfig] = Field(default_factory=list)

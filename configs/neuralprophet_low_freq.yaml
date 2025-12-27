@@ -1,0 +1,59 @@
+name: neural_prophet
+lag_days: 7
+n_forecast: 1.1
+model_dir: outputs/models/low_freq
+
+# Data frequency
+freq: 1h
+freq_per_day: 24
+
+# Seasonality - weekly for low-freq components
+yearly_seasonality: true
+weekly_seasonality: true
+daily_seasonality: false
+seasonality_mode: additive
+
+# Custom seasonalities matching savgol_base periods
+# custom_seasonalities:
+#   - name: multi_day
+#     period: 3.5      # ~3.5 days (center of 2.4-5 band)
+#     fourier_order: 10
+#   - name: bi-weekly
+#     period: 14.0      # 1 week
+#     fourier_order: 10
+
+
+# Trend
+n_changepoints: 28
+changepoints_range: 0.85
+
+# No internal decomposition - handled externally
+decomposer:
+  method: none
+
+# AR configuration - simpler for smoother low-freq signals
+ar_layers: []
+ar_reg: 0.5
+
+# Trend regularization
+trend_reg: 0.5
+
+# Training
+epochs: 1
+batch_size: 64
+learning_rate: 0.1
+loss_func: SmoothL1Loss
+optimizer: AdamW
+
+# Early stopping
+early_stopping: false
+valid_pct: 0.0
+
+# Uncertainty
+quantiles:
+  - 0.16
+  - 0.84
+
+# Data handling
+drop_missing: true
+impute_missing: true

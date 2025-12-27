@@ -4,8 +4,10 @@ n_forecast: 1
 model_dir: outputs/models/prophet
 
 # Data frequency
-freq: 15min
-freq_per_day: 96
+# freq: 15min
+# freq_per_day: 96
+freq: 1h
+freq_per_day: 24
 
 # Disable built-in seasonalities
 yearly_seasonality: false

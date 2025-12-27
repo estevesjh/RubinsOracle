@@ -1,1235 +1,652 @@
-"""Ensemble forecaster combining multiple Prophet/NeuralProphet models.
-
-This module implements the EnsembleForecaster class which operates on decomposed
-frequency bands, training specialized models for each band and combining their
-forecasts with optional bias correction.
-"""
+"""Ensemble Forecaster combining multiple NeuralProphet models on decomposed signals."""
 
 from __future__ import annotations
 
-import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.interpolate import interp1d
 
-from ..base import ValidationMixin
-from ..config import (
-    ComponentConfig,
-    EnsembleConfig,
-)
-from ..utils import FrequencyConverter, MetricsCalculator
-
-if TYPE_CHECKING:
-    from ..base import Forecaster
+from rubin_oracle.config import NeuralProphetConfig
+from rubin_oracle.models.neural_prophet import NeuralProphetForecaster
+from rubin_oracle.utils.postprocessing import PostProcessor
 
 
-class EnsembleForecaster(ValidationMixin):
-    """Ensemble forecaster combining multiple Prophet/NeuralProphet models.
+class EnsembleForecaster:
+    """Ensemble forecaster using multiple NeuralProphet models on pre-decomposed signals.
 
-    Each component model operates on a subset of decomposed frequency bands,
-    optionally at different resolutions. Forecasts are combined and optionally
-    post-processed with bias correction or ETS blending.
+    Expects input data to be pre-decomposed externally. Fits separate NeuralProphet
+    models on high-frequency and low-frequency components and combines their forecasts.
 
     Example:
-        >>> config = EnsembleConfig.from_yaml("configs/ensemble_dual_prophet.yaml")
-        >>> model = EnsembleForecaster(config)
-        >>> model.fit(df_train)
-        >>> forecast = model.predict(df_history, periods=96)
+        >>> from rubin_oracle.config import NeuralProphetConfig
+        >>> high_cfg = NeuralProphetConfig.from_yaml("configs/high_freq.yaml")
+        >>> low_cfg = NeuralProphetConfig.from_yaml("configs/low_freq.yaml")
+        >>> forecaster = EnsembleForecaster(
+        ...     high_freq_config=high_cfg,
+        ...     low_freq_config=low_cfg,
+        ...     high_freq_cols=["y_high_12h", "y_high_24h"],
+        ...     low_freq_cols=["y_low_7d"],
+        ... )
+        >>> forecaster.fit(df_decomposed)
+        >>> forecast = forecaster.predict(df_recent_decomposed)
     """
 
-    def __init__(self, config: EnsembleConfig):
+    def __init__(
+        self,
+        high_freq_config: NeuralProphetConfig,
+        low_freq_config: NeuralProphetConfig,
+        high_freq_cols: list[str],
+        low_freq_cols: list[str],
+        combine_method: str = "sum",
+        bias_correction: bool = True,
+        bias_window_hours: float = 6.0,
+        bias_method: str = "median",
+        output_freq: str | None = None,
+    ):
         """Initialize EnsembleForecaster.
 
         Args:
-            config: Ensemble configuration
+            high_freq_config: NeuralProphetConfig for high-frequency model
+            low_freq_config: NeuralProphetConfig for low-frequency model
+            high_freq_cols: Column names for high-frequency components (e.g., ["y_high_12h"])
+            low_freq_cols: Column names for low-frequency components (e.g., ["y_low_7d"])
+            combine_method: How to combine forecasts ("sum" or "weighted")
+            bias_correction: Apply bias correction post-processing
+            bias_window_hours: Hours of recent data for bias estimation
+            bias_method: Bias calculation method ("median" or "mean")
+            output_freq: Output frequency for combined forecast (defaults to high_freq_config.freq)
         """
-        self.config = config
-        self.name = config.name
-        self._decomposer = None
-        self._components: list[tuple[ComponentConfig, Forecaster]] = []
-        self._df_decomposed_cache: pd.DataFrame | None = None
+        self.name = "ensemble"
+
+        # Store configs
+        self._high_freq_config = high_freq_config
+        self._low_freq_config = low_freq_config
+
+        # Frequency settings - extract from configs
+        self._high_freq = high_freq_config.freq
+        self._low_freq = low_freq_config.freq
+        self._output_freq = output_freq or self._high_freq  # Default to finest resolution
+
+        # Column mappings
+        self._high_freq_cols = high_freq_cols
+        self._low_freq_cols = low_freq_cols
+
+        # Combination settings
+        self._combine_method = combine_method
+
+        # Bias correction settings
+        self._bias_correction = bias_correction
+        self._bias_window_hours = bias_window_hours
+        self._bias_method = bias_method
+
+        # Models
+        self._models: dict[str, NeuralProphetForecaster] = {}
+
+        # State
         self._is_fitted = False
+        self._training_end: pd.Timestamp | None = None
         self.metrics_: dict | None = None
 
-        # Compute frequency constants
-        self._freq_per_hour = self._parse_freq_per_hour(config.output_freq)
-        self._steps_per_day_base = self._freq_per_hour * 24
+    def _init_models(self) -> None:
+        """Initialize NeuralProphet models for each component."""
+        self._models["high_freq"] = NeuralProphetForecaster(self._high_freq_config)
+        self._models["low_freq"] = NeuralProphetForecaster(self._low_freq_config)
 
-    @property
-    def components(self) -> dict[str, Forecaster]:
-        """Get component models as a dictionary by name.
-
-        Example:
-            >>> model.components['high_freq']  # Access high_freq model
-            >>> model.components['low_freq']   # Access low_freq model
-        """
-        return {config.name: forecaster for config, forecaster in self._components}
-
-    def get_component_names(self) -> list[str]:
-        """Get list of component model names.
-
-        Returns:
-            List of component names (e.g., ['high_freq', 'low_freq'])
-        """
-        return [config.name for config, _ in self._components]
-
-    def __getattr__(self, name: str):
-        """Allow access to component models via attribute (e.g., model.high_freq_model)."""
-        if name.endswith("_model"):
-            component_name = name[:-6]  # Remove '_model' suffix
-            for config, forecaster in self._components:
-                if config.name == component_name:
-                    return forecaster
-        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
-
-    def _parse_freq_per_hour(self, freq: str) -> float:
-        """Parse frequency string to steps per hour."""
-        return FrequencyConverter.freq_to_samples_per_hour(freq)
-
-    def _create_decomposer(self):
-        """Create decomposer based on config method."""
-        method = self.config.decomposer.method
-
-        if method == "none":
-            raise ValueError("EnsembleForecaster requires decomposition (method != 'none')")
-
-        # Get decomposer parameters, excluding method-specific ones
-        if method == "bandpass":
-            from ..preprocessing import BandpassDecomposer
-
-            # Exclude VMD-specific parameters
-            exclude_keys = {"method", "alpha", "K_stage1", "K_stage2"}
-            params = {
-                k: v
-                for k, v in self.config.decomposer.model_dump().items()
-                if k not in exclude_keys
-            }
-            # Convert freq from string (e.g., "15min") to samples per day
-            if isinstance(params["freq"], str):
-                freq_per_hour = self._parse_freq_per_hour(params["freq"])
-                params["freq"] = int(freq_per_hour * 24)
-            return BandpassDecomposer(**params)
-        elif method == "vmd":
-            from ..preprocessing import RubinVMDDecomposer
-
-            # Exclude bandpass-specific parameters
-            exclude_keys = {
-                "method",
-                "period_pairs",
-                "filter_type",
-                "edge_method",
-                "edge_pad_periods",
-                "nan_fill",
-                "nan_fill_period",
-                "use_edge_weighting",
-                "butter_order",
-                "savgol_polyorder",
-                "savgol_butter_cleanup",
-            }
-            params = {
-                k: v
-                for k, v in self.config.decomposer.model_dump().items()
-                if k not in exclude_keys
-            }
-            return RubinVMDDecomposer(**params)
-        else:
-            raise ValueError(f"Unknown decomposer method: {method}")
-
-    def _validate_decomposition(self, df: pd.DataFrame, df_decomposed: pd.DataFrame) -> dict:
-        """Verify decomposition and report signal recovery metrics.
-
-        Args:
-            df: Original dataframe with 'y' column
-            df_decomposed: Decomposed dataframe with band columns
-
-        Returns:
-            Dict with 'mean_bias' and 'variance_recovered'
-        """
-        # Detect band columns (works with bandpass, VMD, etc.)
-        band_cols = [
-            c for c in df_decomposed.columns if c.startswith(("y_band_", "y_imf_", "y_mode_"))
-        ]
-
-        if not band_cols:
-            warnings.warn("No band columns found in decomposed data", stacklevel=2)
-            return {"mean_bias": np.nan, "variance_recovered": np.nan}
-
-        reconstructed = df_decomposed[band_cols].sum(axis=1)
-        original = df["y"].values
-
-        residual = original - reconstructed.values
-
-        # Compute metrics (NaN-safe)
-        original_var = np.nanvar(original)
-        residual_var = np.nanvar(residual)
-        recovered_var_ratio = 1 - (residual_var / original_var) if original_var > 0 else 1.0
-        mean_bias = np.nanmean(residual)
-        max_abs_residual: float = float(np.nanmax(np.abs(residual)))
-
-        # Print signal recovery report
-        print("=" * 60)
-        print("DECOMPOSITION SIGNAL RECOVERY")
-        print("=" * 60)
-        print(f"Original signal variance:    {original_var:.4f}")
-        print(f"Residual variance:           {residual_var:.6f}")
-        print(f"Variance recovered:          {recovered_var_ratio * 100:.2f}%")
-        print(f"Mean bias:                   {mean_bias:.4f}°C")
-        print(f"Max absolute residual:       {max_abs_residual:.4f}°C")
-        print("-" * 60)
-        for col in band_cols:
-            band_var = df_decomposed[col].var(skipna=True)
-            pct = (
-                band_var / original_var * 100
-                if original_var > 0 and not np.isnan(original_var)
-                else 0
-            )
-            print(f"  {col}: variance={band_var:.4f} ({pct:.1f}%)")
-        print("=" * 60)
-
-        if np.abs(mean_bias) > 0.01:
-            warnings.warn(f"Decomposition bias detected: {mean_bias:.4f}°C", stacklevel=2)
-        if recovered_var_ratio < 0.99:
-            warnings.warn(f"Low variance recovery: {recovered_var_ratio * 100:.1f}%", stacklevel=2)
-
-        return {"mean_bias": mean_bias, "variance_recovered": recovered_var_ratio}
-
-    def _get_band_columns(self, df_decomposed: pd.DataFrame) -> list[str]:
-        """Get list of band column names."""
-        return [c for c in df_decomposed.columns if c.startswith(("y_band_", "y_imf_", "y_mode_"))]
-
-    def _create_model(self, comp_config: ComponentConfig) -> Forecaster:
-        """Create a model instance for a component.
-
-        Args:
-            comp_config: Component configuration
-
-        Returns:
-            Forecaster instance (ProphetForecaster or NeuralProphetForecaster)
-        """
-        if comp_config.model_type == "prophet":
-            from ..config import ProphetConfig
-            from .prophet import ProphetForecaster
-
-            # Build custom seasonalities from component config
-            # Prophet expects period in days (not samples)
-            custom_seasonalities = None
-            if comp_config.seasonalities:
-                custom_seasonalities = [
-                    {"name": s.name, "period": s.period, "fourier_order": s.fourier_order}
-                    for s in comp_config.seasonalities
-                ]
-
-            # Determine frequency based on resolution/downsampling
-            freq = comp_config.downsample_to or comp_config.resolution
-
-            # Use component's lag_days if specified, otherwise use ensemble's lag_days
-            lag_days = (
-                comp_config.lag_days if comp_config.lag_days is not None else self.config.lag_days
-            )
-
-            config = ProphetConfig(
-                lag_days=lag_days,
-                n_forecast=self.config.n_forecast,
-                freq=freq,
-                yearly_seasonality=False,
-                weekly_seasonality=False,
-                daily_seasonality=False,
-                n_changepoints=comp_config.n_changepoints,
-                changepoint_prior_scale=comp_config.changepoint_prior_scale,
-                growth=comp_config.growth,
-                custom_seasonalities=custom_seasonalities,
-                train_on_all_history=True,  # Train on full history for ensemble components
-            )
-            return ProphetForecaster(config)
-
-        elif comp_config.model_type == "neural_prophet":
-            from ..config import NeuralProphetConfig
-            from .neural_prophet import NeuralProphetForecaster
-
-            # Build custom seasonalities from component config
-            custom_seasonalities = None
-            if comp_config.seasonalities:
-                # Determine frequency and convert period from days to samples
-                freq = comp_config.downsample_to or comp_config.resolution
-                freq_per_hour = self._parse_freq_per_hour(freq)
-                freq_per_day = freq_per_hour * 24
-
-                custom_seasonalities = [
-                    {
-                        "name": s.name,
-                        "period": int(s.period * freq_per_day),  # Convert days to samples
-                        "fourier_order": s.fourier_order,
-                    }
-                    for s in comp_config.seasonalities
-                ]
-            else:
-                freq = comp_config.downsample_to or comp_config.resolution
-
-            # Use component's lag_days if specified, otherwise use ensemble's lag_days
-            lag_days = (
-                comp_config.lag_days if comp_config.lag_days is not None else self.config.lag_days
-            )
-
-            # All components forecast the same time span (n_forecast steps)
-            # Each converts internally to samples based on its resolution
-            config = NeuralProphetConfig(
-                lag_days=lag_days,
-                n_forecast=self.config.n_forecast,
-                freq=freq,
-                yearly_seasonality=False,
-                weekly_seasonality=False,
-                daily_seasonality=False,
-                ar_layers=comp_config.ar_layers,
-                ar_reg=comp_config.ar_reg,
-                epochs=comp_config.epochs,
-                learning_rate=comp_config.learning_rate,
-                n_changepoints=comp_config.n_changepoints,
-                # Disable early stopping and validation for ensemble components
-                early_stopping=False,
-                valid_pct=0.0,
-                train_on_all_history=True,  # Train on full history for ensemble components
-            )
-            return NeuralProphetForecaster(config)
-
-        else:
-            raise ValueError(f"Unknown model type: {comp_config.model_type}")
-
-    def _downsample(self, df: pd.DataFrame, target_freq: str) -> pd.DataFrame:
-        """Downsample dataframe to target frequency.
+    def _resample_to_freq(self, df: pd.DataFrame, target_freq: str) -> pd.DataFrame:
+        """Downsample data to target frequency (e.g., 1h -> 3h).
 
         Args:
             df: DataFrame with 'ds' and 'y' columns
-            target_freq: Target frequency (e.g., '4h')
+            target_freq: Target frequency string (e.g., "3h")
 
         Returns:
-            Downsampled DataFrame
+            Resampled DataFrame
         """
-        df_copy = df.copy()
-        df_copy = df_copy.set_index("ds")
-        df_resampled = df_copy[["y"]].resample(target_freq).mean()
-        return df_resampled.reset_index()
+        df_resampled = df.set_index("ds").resample(target_freq).mean().reset_index()
+        return df_resampled.dropna()
 
-    def _upsample_forecast(
-        self, yhat: np.ndarray, from_freq: str, to_freq: str, n_periods: int
-    ) -> np.ndarray:
-        """Upsample forecast from coarse to fine resolution.
+    def _upsample_to_freq(self, df: pd.DataFrame, target_freq: str) -> pd.DataFrame:
+        """Upsample data to finer frequency (e.g., 3h -> 1h) using forward fill.
 
         Args:
-            yhat: Forecast values at coarse resolution
-            from_freq: Source frequency (e.g., '4h')
-            to_freq: Target frequency (e.g., '15min')
-            n_periods: Number of output periods
+            df: DataFrame with 'ds' column and value columns
+            target_freq: Target frequency string (e.g., "1h")
 
         Returns:
-            Upsampled forecast array
+            Upsampled DataFrame
         """
-        from_per_hour = self._parse_freq_per_hour(from_freq)
-        to_per_hour = self._parse_freq_per_hour(to_freq)
+        _df = df.drop_duplicates("ds").reset_index(drop=True)
+        df_upsampled = _df.set_index("ds").resample(target_freq).interpolate().reset_index()
+        return df_upsampled
 
-        ratio = to_per_hour / from_per_hour
-
-        # Create interpolation
-        x_from = np.arange(len(yhat)) * ratio
-        x_to = np.arange(n_periods)
-
-        f = interp1d(x_from, yhat, kind="linear", fill_value="extrapolate")
-        return f(x_to)
-
-    def _steps_per_day(self, comp_config: ComponentConfig) -> int:
-        """Get steps per day for a component."""
-        freq = comp_config.downsample_to or comp_config.resolution
-        return int(self._parse_freq_per_hour(freq) * 24)
-
-    def _get_component_data(
-        self, df: pd.DataFrame, df_decomposed: pd.DataFrame, comp_config: ComponentConfig
-    ) -> pd.DataFrame:
-        """Extract data for a component from decomposed signal.
+    def fit(self, df: pd.DataFrame, verbose: bool = False) -> EnsembleForecaster:
+        """Fit ensemble on pre-decomposed data.
 
         Args:
-            df: Original dataframe
-            df_decomposed: Decomposed dataframe
-            comp_config: Component configuration
+            df: Pre-decomposed data with 'ds', 'y', and component columns
+            verbose: Print progress
 
         Returns:
-            DataFrame with 'ds' and 'y' for the component
-        """
-        band_cols = self._get_band_columns(df_decomposed)
-
-        # Sum assigned bands
-        selected_cols = []
-        for idx in comp_config.band_indices:
-            # Find column matching index
-            for col in band_cols:
-                if f"_{idx}" in col:
-                    selected_cols.append(col)
-                    break
-
-        if not selected_cols:
-            raise ValueError(f"No bands found for indices {comp_config.band_indices}")
-
-        df_comp = df[["ds"]].copy()
-        df_comp["y"] = df_decomposed[selected_cols].sum(axis=1)
-
-        # Remove timezone (Prophet doesn't support timezone-aware timestamps)
-        if df_comp["ds"].dt.tz is not None:
-            df_comp["ds"] = df_comp["ds"].dt.tz_localize(None)
-
-        # Downsample if needed
-        if comp_config.downsample_to:
-            df_comp = self._downsample(df_comp, comp_config.downsample_to)
-
-        return df_comp
-
-    def fit(self, df: pd.DataFrame) -> EnsembleForecaster:
-        """Fit all component models.
-
-        1. Decompose signal into frequency bands
-        2. Validate decomposition (check variance recovery)
-        3. For each component:
-           a. Sum assigned bands
-           b. Optionally downsample
-           c. Fit component model
-
-        Args:
-            df: Training data with 'ds' and 'y' columns
-
-        Returns:
-            self
-        """
-        # Validate input
-        if "ds" not in df.columns or "y" not in df.columns:
-            raise ValueError("DataFrame must have 'ds' and 'y' columns")
-
-        # Initialize decomposer
-        self._decomposer = self._create_decomposer()
-
-        # Decompose full signal
-        print(f"\nFitting EnsembleForecaster with {len(self.config.components)} components...")
-        df_decomposed = self._decomposer.decompose(df)
-        self._df_decomposed_cache = df_decomposed
-
-        # Validate decomposition
-        self._validate_decomposition(df, df_decomposed)
-
-        # Clear previous components
-        self._components = []
-
-        # Fit each component
-        for i, comp_config in enumerate(self.config.components):
-            print(
-                f"\n[{i + 1}/{len(self.config.components)}] Fitting component: {comp_config.name}"
-            )
-            print(f"  Model type: {comp_config.model_type}")
-            print(f"  Bands: {comp_config.band_indices}")
-            print(f"  Lag days: {comp_config.lag_days}")
-            if comp_config.downsample_to:
-                print(f"  Downsampled to: {comp_config.downsample_to}")
-
-            # Get component data
-            df_comp = self._get_component_data(df, df_decomposed, comp_config)
-            print(f"  Training samples: {len(df_comp)}")
-
-            # Create and fit model
-            model = self._create_model(comp_config)
-            model.fit(df_comp)
-
-            self._components.append((comp_config, model))
-
-        # Compute ensemble metrics
-        self._compute_metrics(df, df_decomposed)
-
-        self._is_fitted = True
-        print("\nEnsembleForecaster fitted successfully.")
-        return self
-
-    def _compute_metrics(self, df: pd.DataFrame, df_decomposed: pd.DataFrame) -> None:
-        """Compute ensemble fit metrics.
-
-        Aggregates metrics from component models and computes overall
-        in-sample reconstruction error.
-
-        Args:
-            df: Original training data
-            df_decomposed: Decomposed training data
-        """
-        # Collect component metrics
-        component_metrics = {}
-        for comp_config, model in self._components:
-            if hasattr(model, "metrics_") and model.metrics_ is not None:
-                component_metrics[comp_config.name] = model.metrics_
-
-        # Compute overall ensemble in-sample metrics
-        # Get combined in-sample predictions
-        y_true = df["y"].values.astype(float)
-        y_pred = np.full_like(y_true, np.nan, dtype=float)
-
-        component_preds = []
-        for comp_config, model in self._components:
-            # Get component data
-            df_comp = self._get_component_data(df, df_decomposed, comp_config)
-
-            # Get in-sample predictions (fitted values)
-            try:
-                if hasattr(model, "fitted"):
-                    fc = model.fitted()
-                    # Prophet returns "yhat", NeuralProphet returns "yhat1", "yhat2", etc
-                    if "yhat" in fc.columns:
-                        # Prophet case
-                        comp_yhat = fc["yhat"].values.astype(float)
-                    elif "yhat1" in fc.columns:
-                        # NeuralProphet case: use 1-step ahead predictions
-                        comp_yhat = fc["yhat1"].values.astype(float)
-                    else:
-                        # Fallback: try first yhat* column
-                        yhat_cols = [c for c in fc.columns if c.startswith("yhat")]
-                        comp_yhat = (
-                            fc[yhat_cols[0]].values.astype(float)
-                            if yhat_cols
-                            else np.zeros(len(df_comp))
-                        )
-                else:
-                    comp_yhat = np.zeros(len(df_comp))
-            except Exception as e:
-                warnings.warn(
-                    f"Could not get fitted predictions for {comp_config.name}: {e}", stacklevel=2
-                )
-                comp_yhat = np.zeros(len(df_comp))
-
-            # Upsample if needed (keep NaN - don't replace with 0)
-            if comp_config.downsample_to:
-                comp_yhat = self._upsample_forecast(
-                    comp_yhat, comp_config.downsample_to, self.config.output_freq, len(y_true)
-                )
-
-            # Align to y_true length
-            aligned = np.full(len(y_true), np.nan)
-            min_len = min(len(comp_yhat), len(y_true))
-            aligned[-min_len:] = comp_yhat[-min_len:]
-            component_preds.append(aligned)
-
-        # Sum components only where ALL have valid values
-        component_preds = np.array(component_preds)
-        all_valid_mask = ~np.any(np.isnan(component_preds), axis=0)
-        y_pred[all_valid_mask] = np.sum(component_preds[:, all_valid_mask], axis=0)
-
-        # Compute overall metrics (NaN-safe)
-        # Filter out NaN values from both y_true and y_pred
-        valid_mask = ~np.isnan(y_true) & ~np.isnan(y_pred)
-
-        # If no valid samples (common with NeuralProphet due to AR lags alignment),
-        # report component metrics only
-        if valid_mask.sum() == 0:
-            self.metrics_ = {
-                "rmse": float("nan"),
-                "mae": float("nan"),
-                "r2": float("nan"),
-                "n_samples": 0,
-                "components": component_metrics,
-                "note": "Overall metrics unavailable due to AR lag alignment; see component metrics",
-            }
-            # Print metrics summary (component metrics only)
-            print("\n" + "=" * 60)
-            print("ENSEMBLE FIT METRICS")
-            print("=" * 60)
-            print("Overall metrics: N/A (component AR lags don't align)")
-            print("-" * 60)
-            for name, m in component_metrics.items():
-                print(f"  {name}: RMSE={m['rmse']:.4f}, MAE={m['mae']:.4f}, R²={m['r2']:.4f}")
-            print("=" * 60)
-            return
-        y_true_valid = y_true[valid_mask]
-        y_pred_valid = y_pred[valid_mask]
-
-        if len(y_true_valid) == 0:
-            self.metrics_ = {
-                "rmse": float("nan"),
-                "mae": float("nan"),
-                "r2": float("nan"),
-                "n_samples": 0,
-                "components": component_metrics,
-            }
-            return
-
-        # Compute metrics using helper
-        metrics_dict = MetricsCalculator.compute_metrics(y_true_valid, y_pred_valid)
-        self.metrics_ = {
-            **metrics_dict,
-            "components": component_metrics,
-        }
-
-        # Print metrics summary
-        print("\n" + "=" * 60)
-        print("ENSEMBLE FIT METRICS")
-        print("=" * 60)
-        print(f"Overall RMSE: {metrics_dict['rmse']:.4f}")
-        print(f"Overall MAE:  {metrics_dict['mae']:.4f}")
-        print(f"Overall R²:   {metrics_dict['r2']:.4f}")
-        print("-" * 60)
-        for name, metrics in component_metrics.items():
-            print(
-                f"  {name}: RMSE={metrics['rmse']:.4f}, MAE={metrics['mae']:.4f}, R²={metrics['r2']:.4f}"
-            )
-        print("=" * 60)
-
-    def _combine_forecasts(self, forecasts: list[np.ndarray]) -> np.ndarray:
-        """Combine component forecasts.
-
-        Args:
-            forecasts: List of forecast arrays (one per component)
-
-        Returns:
-            Combined forecast array
-        """
-        if self.config.combine_method == "sum":
-            return np.sum(forecasts, axis=0)
-
-        elif self.config.combine_method == "weighted":
-            if self.config.component_weights is None:
-                # Equal weights
-                weights = np.ones(len(forecasts)) / len(forecasts)
-            else:
-                weights = np.array(self.config.component_weights)
-                if len(weights) != len(forecasts):
-                    raise ValueError("Number of weights must match number of components")
-
-            return np.sum([w * f for w, f in zip(weights, forecasts)], axis=0)
-
-        else:
-            raise ValueError(f"Unknown combine method: {self.config.combine_method}")
-
-    def _compute_robust_bias(
-        self, y_history: np.ndarray, yhat_history: np.ndarray, window_hours: float = 6.0
-    ) -> float:
-        """Compute robust bias from recent forecast residuals.
-
-        Args:
-            y_history: Recent actual values
-            yhat_history: Recent forecasts (aligned with y_history)
-            window_hours: Lookback window for computing bias
-
-        Returns:
-            Bias estimate
-        """
-        window_steps = int(window_hours * self._freq_per_hour)
-        window_steps = min(window_steps, len(y_history), len(yhat_history))
-
-        if window_steps < 1:
-            return 0.0
-
-        residuals = y_history[-window_steps:] - yhat_history[-window_steps:]
-
-        method = self.config.post_processor.bias_method
-        if method == "median":
-            return float(np.median(residuals))
-        elif method == "mean":
-            return float(np.mean(residuals))
-        else:  # "last"
-            return float(y_history[-1] - yhat_history[-1])
-
-    def _apply_post_processing(
-        self,
-        yhat: np.ndarray,
-        y_history: np.ndarray,
-        yhat_history: np.ndarray | None = None,
-        has_neural_prophet: bool = False,
-    ) -> np.ndarray:
-        """Apply post-processing to combined forecast.
-
-        Args:
-            yhat: Combined forecast
-            y_history: Recent actual values
-            yhat_history: Recent in-sample forecasts (optional)
-            has_neural_prophet: Whether any component is NeuralProphet
-
-        Returns:
-            Post-processed forecast
-        """
-        pp = self.config.post_processor
-
-        # Skip bias correction for NeuralProphet unless explicitly enabled
-        if has_neural_prophet and not pp.bias_for_neural_prophet:
-            apply_bias = False
-        else:
-            apply_bias = pp.bias_correction
-
-        # Apply bias correction
-        if apply_bias:
-            if yhat_history is not None and len(yhat_history) > 0:
-                bias = self._compute_robust_bias(y_history, yhat_history, pp.bias_window_hours)
-            else:
-                # Fallback: use last value difference
-                bias = y_history[-1] - yhat[0]
-            yhat = yhat + bias
-
-        # Apply ETS blend
-        if pp.ets_blend:
-            yhat = self._apply_ets_blend(yhat, y_history, pp.ets_tau)
-
-        return yhat
-
-    def _apply_ets_blend(self, yhat: np.ndarray, y_history: np.ndarray, tau: int) -> np.ndarray:
-        """Blend forecast with exponential smoothing.
-
-        Args:
-            yhat: Forecast to blend
-            y_history: Recent history
-            tau: Decay constant in steps
-
-        Returns:
-            Blended forecast
-        """
-        try:
-            from statsmodels.tsa.holtwinters import ExponentialSmoothing
-
-            n_history = min(96, len(y_history))
-            y_recent = y_history[-n_history:]
-
-            model = ExponentialSmoothing(
-                y_recent, trend="add", seasonal=None, initialization_method="estimated"
-            )
-            fit = model.fit(optimized=True)
-            yhat_ets = fit.forecast(len(yhat))
-
-        except Exception:
-            # Fallback: linear extrapolation
-            n_fit = min(8, len(y_history))
-            x = np.arange(n_fit)
-            slope, intercept = np.polyfit(x, y_history[-n_fit:], 1)
-            x_future = np.arange(n_fit, n_fit + len(yhat))
-            yhat_ets = slope * x_future + intercept
-
-        # Exponentially decaying blend
-        alpha = np.exp(-np.arange(len(yhat)) / tau)
-        return alpha * yhat_ets + (1 - alpha) * yhat
-
-    def _get_fitted_values(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Get in-sample fitted values for the ensemble.
-
-        Combines fitted values from all components by:
-        1. Getting in-sample predictions from each component model
-        2. Upsampling downsampled components
-        3. Summing all components
-
-        Args:
-            df: Historical data with 'ds' and 'y' columns (must match training data)
-
-        Returns:
-            DataFrame with 'ds' and 'yhat' columns
+            Self for method chaining
         """
         df = df.copy()
-        df["ds"] = pd.to_datetime(df["ds"])
 
-        # Store original timezone for later
-        original_tz = df["ds"].dt.tz
+        # Initialize models
+        self._init_models()
 
-        # Remove timezone for merging (Prophet strips timezone)
-        if original_tz is not None:
-            df["ds"] = df["ds"].dt.tz_localize(None)
+        self._training_end = df["ds"].max()
 
-        # Initialize combined yhat
-        yhat_combined = np.zeros(len(df), dtype=float)
+        # Fit high_freq model
+        if verbose:
+            print(f"Fitting high_freq on columns: {self._high_freq_cols} (freq={self._high_freq})")
+        df_high = df[["ds"]].copy()
+        df_high["y"] = df[self._high_freq_cols].sum(axis=1)
+        # Resample if high_freq differs from input (output) frequency
+        if self._high_freq != self._output_freq:
+            df_high = self._resample_to_freq(df_high, self._high_freq)
+        self._models["high_freq"].fit(df_high[["ds", "y"]], verbose=verbose)
 
-        for comp_config, model in self._components:
-            if not hasattr(model, "_fit_df") or model._fit_df is None:
-                continue
+        # Fit low_freq model
+        if verbose:
+            print(f"Fitting low_freq on columns: {self._low_freq_cols} (freq={self._low_freq})")
+        df_low = df[["ds"]].copy()
+        df_low["y"] = df[self._low_freq_cols].sum(axis=1)
+        # Resample if low_freq differs from input (output) frequency
+        if self._low_freq != self._output_freq:
+            df_low = self._resample_to_freq(df_low, self._low_freq)
+        self._models["low_freq"].fit(df_low[["ds", "y"]], verbose=verbose)
 
-            # Get in-sample predictions from component using fitted() method
-            fit_pred = model.fitted()
+        self._is_fitted = True
+        self._compute_metrics()
 
-            # Prophet returns "yhat", NeuralProphet returns "yhat1", "yhat2", etc
-            if "yhat" in fit_pred.columns:
-                # Prophet case
-                comp_yhat = fit_pred["yhat"].values
-            elif "yhat1" in fit_pred.columns:
-                # NeuralProphet case: use 1-step ahead predictions
-                comp_yhat = fit_pred["yhat1"].values
-            else:
-                # Fallback: try first yhat* column
-                yhat_cols = [c for c in fit_pred.columns if c.startswith("yhat")]
-                comp_yhat = fit_pred[yhat_cols[0]].values if yhat_cols else np.zeros(len(fit_pred))
-            comp_ds = pd.to_datetime(fit_pred["ds"])
+        return self
 
-            # Ensure comp_ds is timezone-naive for merging
-            if comp_ds.dt.tz is not None:
-                comp_ds = comp_ds.dt.tz_localize(None)
-
-            # Upsample if needed
-            if comp_config.downsample_to:
-                comp_yhat = self._upsample_forecast(
-                    comp_yhat, comp_config.downsample_to, self.config.output_freq, len(df)
-                )
-                # Upsampled values align with the end of df
-                min_len = min(len(comp_yhat), len(df))
-                yhat_combined[-min_len:] += comp_yhat[-min_len:]
-            else:
-                # No downsampling - align by timestamp
-                # Create a mapping from component timestamps to yhat values
-                comp_df = pd.DataFrame({"ds": comp_ds, "comp_yhat": comp_yhat})
-                merged = df[["ds"]].merge(comp_df, on="ds", how="left")
-                merged["comp_yhat"] = merged["comp_yhat"].fillna(0)
-                yhat_combined += merged["comp_yhat"].values
-
-        # Restore original timezone
-        result_ds = df["ds"]
-        if original_tz is not None:
-            result_ds = result_ds.dt.tz_localize(original_tz)
-
-        return pd.DataFrame({"ds": result_ds, "yhat": yhat_combined})
-
-    def forecast(self, df: pd.DataFrame | None = None, periods: int | None = None) -> pd.DataFrame:
-        """Generate ensemble forecast (orchestrator method).
-
-        This is the public forecasting method that handles:
-        1. Data preparation and decomposition
-        2. Component forecast generation
-        3. Forecast combination
-        4. Post-processing
+    def predict(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Generate ensemble forecast from pre-decomposed data.
 
         Args:
-            df: History dataframe (required for NeuralProphet components)
-            periods: Number of periods to forecast in days. If None, uses config.n_forecast
+            df: Pre-decomposed recent data for AR context
 
         Returns:
-            DataFrame with 'ds', 'yhat', and step columns
+            DataFrame with combined forecast at output_freq resolution
         """
         if not self._is_fitted:
-            raise RuntimeError("Model must be fitted before prediction")
+            raise RuntimeError("Call fit() first")
 
-        # Use config default if periods not provided
-        if periods is None:
-            periods = self.config.n_forecast
+        # High-freq forecast
+        df_high = df[["ds"]].copy()
+        df_high["y"] = df[self._high_freq_cols].sum(axis=1)
 
-        # Convert periods from days to samples
-        periods_samples = FrequencyConverter.days_to_samples(periods, self.config.output_freq)
+        df_low = df[["ds"]].copy()
+        df_low["y"] = df[self._low_freq_cols].sum(axis=1)
 
-        # Prepare data: decompose and get component-specific data
-        forecasts = []
-        df_decomposed = None
-        if df is not None:
-            df_decomposed = self._decomposer.decompose(df)
+        forecast_high_raw = self._models["high_freq"].predict(
+            df, include_history=True, window_days=int(2 * self._models["low_freq"].config.lag_days)
+        )
+        forecast_low_raw = self._models["low_freq"].predict(
+            df, include_history=True, window_days=int(2 * self._models["low_freq"].config.lag_days)
+        )
+        forecast_high = self._models["high_freq"].standardize_output(forecast_high_raw)
+        forecast_low = self._models["low_freq"].standardize_output(forecast_low_raw)
 
-        # Check if any component is NeuralProphet
-        has_neural_prophet = any(
-            comp_config.model_type == "neural_prophet" for comp_config, _ in self._components
+        # Upsample output if needed
+        if self._high_freq != self._output_freq:
+            forecast_high = self._upsample_to_freq(forecast_high, self._output_freq)
+
+        # Upsample output if needed
+        if self._low_freq != self._output_freq:
+            forecast_low = self._upsample_to_freq(forecast_low, self._output_freq)
+
+        # Combine forecasts (merge on timestamp to handle alignment)
+        combined = self._combine_forecasts(forecast_high, forecast_low)
+
+        all_cols = self._high_freq_cols + self._low_freq_cols
+        df["y"] = df[all_cols].sum(axis=1)
+        self._fit_df = df
+
+        # Post-process
+        if self._bias_correction:
+            combined = self._apply_bias_correction(combined, df)
+
+        return combined
+
+    def _combine_forecasts(
+        self, forecast_high: pd.DataFrame, forecast_low: pd.DataFrame
+    ) -> pd.DataFrame:
+        """Combine component forecasts into ensemble prediction.
+
+        Merges on timestamp to handle different forecast lengths from resampling.
+        """
+        # Normalize ds columns for merging
+        forecast_high = forecast_high.copy()
+        forecast_low = forecast_low.copy()
+
+        # Get yhat columns from low_freq to merge
+        yhat_cols = [c for c in forecast_low.columns if c.startswith("yhat")]
+        merge_cols = ["ds"] + yhat_cols
+
+        # Merge on ds
+        result = forecast_high.merge(
+            forecast_low[merge_cols],
+            on="ds",
+            how="left",
+            suffixes=("_high", "_low"),
         )
 
-        # Generate forecasts from each component
-        for comp_config, model in self._components:
-            # Get component-specific prepared data
-            if df_decomposed is not None:
-                df_comp = self._get_component_data(df, df_decomposed, comp_config)
-            else:
-                df_comp = None
+        # Sum yhat columns
+        if self._combine_method == "sum":
+            result["yhat"] = result["yhat_high"] + result["yhat_low"]
+            result["yhat_lower"] = result["yhat_lower_high"] + result["yhat_lower_low"]
+            result["yhat_upper"] = result["yhat_upper_high"] + result["yhat_upper_low"]
+        return result
 
-            # Calculate periods at component resolution
-            if comp_config.downsample_to:
-                from_per_hour = self._parse_freq_per_hour(comp_config.downsample_to)
-                to_per_hour = self._freq_per_hour
-                comp_periods_samples = (
-                    int(np.ceil(periods_samples * from_per_hour / to_per_hour)) + 1
-                )
-            else:
-                comp_periods_samples = periods_samples
-
-            # Generate forecast using component's forecast method
-            fc = model.forecast(df_comp, periods=comp_periods_samples)
-
-            # Extract yhat values from standardized output
-            yhat = self._extract_yhat_from_forecast(fc, comp_periods_samples, comp_config)
-
-            # Upsample if needed
-            if comp_config.downsample_to:
-                yhat = self._upsample_forecast(
-                    yhat, comp_config.downsample_to, self.config.output_freq, periods_samples
-                )
-
-            # Ensure correct length
-            yhat = yhat[:periods_samples]
-            if len(yhat) < periods_samples:
-                # Pad with last value if needed
-                yhat = np.pad(yhat, (0, periods_samples - len(yhat)), mode="edge")
-
-            forecasts.append(yhat)
-
-        # Combine forecasts
-        yhat_combined = self._combine_forecasts(forecasts)
-
-        # Apply post-processing
-        if df is not None:
-            y_history = df["y"].values
-            # TODO: Get in-sample forecasts for robust bias
-            yhat_combined = self._apply_post_processing(
-                yhat_combined, y_history, None, has_neural_prophet
-            )
-
-        # Build output DataFrame
-        return self._build_output(df, yhat_combined, periods_samples)
-
-    def _extract_yhat_from_forecast(
-        self, fc: pd.DataFrame, periods: int, comp_config: ComponentConfig
-    ) -> np.ndarray:
-        """Extract yhat values from component forecast output.
-
-        Handles both standardized formats from ProphetForecaster and NeuralProphetForecaster.
-
-        Args:
-            fc: Component forecast DataFrame
-            periods: Number of forecast periods
-            comp_config: Component configuration
-
-        Returns:
-            Array of yhat values
-        """
-        if "yhat" in fc.columns:
-            # Prophet format: simple yhat column
-            return fc["yhat"].values
-        else:
-            # NeuralProphet multi-step format: yhat1, yhat2, ..., yhatN
-            # For forecasting, extract multi-step values from the LAST valid row
-            yhat_cols = sorted(
-                [c for c in fc.columns if c.startswith("yhat") and c[4:].isdigit()],
-                key=lambda x: int(x[4:]),
-            )
-            if not yhat_cols:
-                raise ValueError(f"No yhat column found in forecast from {comp_config.name}")
-
-            # Find the last row with valid yhat1 (the forecast origin)
-            valid_mask = fc["yhat1"].notna()
-            if valid_mask.any():
-                last_valid_idx = valid_mask[valid_mask].index[-1]
-                # Extract yhat1, yhat2, ..., yhatN from this row as the multi-step forecast
-                yhat = np.array([fc.loc[last_valid_idx, col] for col in yhat_cols[:periods]])
-            else:
-                # Fallback: use last non-NaN values from each column
-                yhat = np.array(
-                    [
-                        fc[col].dropna().iloc[-1] if fc[col].notna().any() else np.nan
-                        for col in yhat_cols[:periods]
-                    ]
-                )
-            return yhat
-
-    def predict(self, df: pd.DataFrame | None = None, periods: int | None = None) -> pd.DataFrame:
-        """Simple wrapper for backward compatibility (deprecated - use forecast instead)."""
-        return self.forecast(df=df, periods=periods)
-
-    def _build_output(
-        self, df: pd.DataFrame | None, yhat: np.ndarray, periods: int
+    def _apply_bias_correction(
+        self, forecast: pd.DataFrame, df_recent: pd.DataFrame
     ) -> pd.DataFrame:
-        """Build output DataFrame from forecast.
+        """Apply bias correction using recent residuals."""
+        # Calculate number of rows from hours and frequency
+        freq_hours = pd.to_timedelta(self._output_freq).total_seconds() / 3600
+        bias_window_rows = int(self._bias_window_hours / freq_hours)
+
+        # Create actual_df with 'y' column
+        actual_df = df_recent[["y"]].copy()
+
+        return PostProcessor.apply_bias_correction(
+            forecast_df=forecast,
+            actual_df=actual_df,
+            bias_window_rows=bias_window_rows,
+            bias_method=self._bias_method,
+        )
+
+    def fitted(self, window_days: float = 14.0) -> pd.DataFrame:
+        """Get combined fitted values from all components.
 
         Args:
-            df: Input history (for timestamps)
-            yhat: Forecast values
-            periods: Number of periods
+            window_days: Days of history to return
 
         Returns:
-            DataFrame with 'ds', 'yhat', 'step' columns
+            DataFrame with ds, y, yhat, yhat_lower, yhat_upper columns at output_freq
         """
-        # Generate timestamps
-        if df is not None and "ds" in df.columns:
-            last_ds = df["ds"].iloc[-1]
-            freq = self.config.output_freq
-            ds = pd.date_range(start=last_ds, periods=periods + 1, freq=freq)[1:]
-        else:
-            ds = pd.RangeIndex(periods)
+        if not self._is_fitted:
+            raise RuntimeError("Model has not been fitted yet.")
 
-        result = pd.DataFrame(
-            {
-                "ds": ds,
-                "yhat": yhat[:periods],
-                "step": np.arange(1, periods + 1),
+        # Ensure window is at least as large as max lag_days + buffer for n_forecasts
+        # Need at least (n_lags + n_forecasts) samples, so add 2 day buffer
+        max_lag = max(self._high_freq_config.lag_days, self._low_freq_config.lag_days)
+        window_days = max(window_days, max_lag + 2)
+
+        # Get fitted values from each component
+        high_fitted = self._models["high_freq"].fitted(window_days=window_days)
+        low_fitted = self._models["low_freq"].fitted(
+            window_days=int(3 * self._models["low_freq"].config.lag_days)
+        )
+
+        # Upsample if frequencies differ from output
+        if self._high_freq != self._output_freq:
+            high_fitted = self._upsample_to_freq(high_fitted, self._output_freq)
+        if self._low_freq != self._output_freq:
+            low_fitted = self._upsample_to_freq(low_fitted, self._output_freq)
+
+        # # Normalize ds columns for merging
+        # if high_fitted["ds"].dt.tz is not None:
+        #     high_fitted["ds"] = high_fitted["ds"].dt.tz_localize(None)
+        # if low_fitted["ds"].dt.tz is not None:
+        #     low_fitted["ds"] = low_fitted["ds"].dt.tz_localize(None)
+
+        # Check for uncertainty bands before renaming
+        has_uncertainty = "yhat_lower" in high_fitted.columns and "yhat_lower" in low_fitted.columns
+
+        # Rename columns to indicate component
+        high_fitted = high_fitted.rename(
+            columns={
+                "yhat": "yhat_high",
+                "yhat_lower": "yhat_lower_high",
+                "yhat_upper": "yhat_upper_high",
+            }
+        )
+        low_fitted = low_fitted.rename(
+            columns={
+                "yhat": "yhat_low",
+                "yhat_lower": "yhat_lower_low",
+                "yhat_upper": "yhat_upper_low",
             }
         )
 
-        return result
+        # Merge on ds to handle alignment
+        high_cols = ["ds", "yhat_high"]
+        low_cols = ["ds", "yhat_low"]
+        if has_uncertainty:
+            high_cols += ["yhat_lower_high", "yhat_upper_high"]
+            low_cols += ["yhat_lower_low", "yhat_upper_low"]
 
-    def standardize_output(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Standardize output format.
+        combined = high_fitted[high_cols].merge(
+            low_fitted[low_cols],
+            on="ds",
+            how="left",
+        )
+        combined["yhat_low"] = combined["yhat_low"].fillna(0)
+        combined["yhat"] = combined["yhat_high"] + combined["yhat_low"]
 
-        Args:
-            df: Prediction output
+        # Combine uncertainty bands
+        if has_uncertainty:
+            combined["yhat_lower_low"] = combined["yhat_lower_low"].fillna(0)
+            combined["yhat_upper_low"] = combined["yhat_upper_low"].fillna(0)
+            combined["yhat_lower"] = combined["yhat_lower_high"] + combined["yhat_lower_low"]
+            combined["yhat_upper"] = combined["yhat_upper_high"] + combined["yhat_upper_low"]
 
-        Returns:
-            Standardized DataFrame
-        """
-        return df
+        window_days_samples = int(
+            window_days * 24 * pd.to_timedelta(self._output_freq).total_seconds() / 3600
+        )
+        return combined.tail(np.abs(window_days_samples))
 
-    def _fit_and_predict(
-        self, df_history: pd.DataFrame, forecast_time: pd.Timestamp
-    ) -> pd.DataFrame:
-        """Fit and predict for validation.
-
-        Args:
-            df_history: History up to forecast_time
-            forecast_time: Time of forecast
-
-        Returns:
-            Multi-step forecast DataFrame
-        """
-        # Refit is handled by ValidationMixin
-        return self.predict(df_history, self.config.n_forecast)
+    def _compute_metrics(self) -> None:
+        """Compute ensemble in-sample metrics."""
+        self.metrics_ = {}
+        for comp_name, model in self._models.items():
+            if model.metrics_:
+                for key, val in model.metrics_.items():
+                    self.metrics_[f"{comp_name}_{key}"] = val
 
     def save(self, path: str | Path) -> None:
-        """Save ensemble model to directory.
-
-        Args:
-            path: Directory path for saving
-        """
+        """Save ensemble to directory."""
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
 
-        # Save config
-        self.config.to_yaml(path / "config.yaml")
+        # Save configs
+        self._high_freq_config.to_yaml(path / "high_freq_config.yaml")
+        self._low_freq_config.to_yaml(path / "low_freq_config.yaml")
+
+        # Save column mappings and settings
+        import json
+
+        settings = {
+            "high_freq_cols": self._high_freq_cols,
+            "low_freq_cols": self._low_freq_cols,
+            "combine_method": self._combine_method,
+            "bias_correction": self._bias_correction,
+            "bias_window_hours": self._bias_window_hours,
+            "bias_method": self._bias_method,
+            "output_freq": self._output_freq,
+        }
+        with open(path / "settings.json", "w") as f:
+            json.dump(settings, f, indent=2)
 
         # Save each component model
-        for i, (comp_config, model) in enumerate(self._components):
-            comp_dir = path / f"component_{i}_{comp_config.name}"
-            model.save(comp_dir)
+        for comp_name, model in self._models.items():
+            model.save(path / comp_name)
 
     @classmethod
     def load(cls, path: str | Path) -> EnsembleForecaster:
-        """Load ensemble model from directory.
+        """Load ensemble from directory."""
+        import json
 
-        Args:
-            path: Directory path to load from
-
-        Returns:
-            Loaded EnsembleForecaster
-        """
         path = Path(path)
 
-        # Load config
-        config = EnsembleConfig.from_yaml(path / "config.yaml")
-        instance = cls(config)
+        # Load configs
+        high_cfg = NeuralProphetConfig.from_yaml(path / "high_freq_config.yaml")
+        low_cfg = NeuralProphetConfig.from_yaml(path / "low_freq_config.yaml")
+
+        # Load settings
+        with open(path / "settings.json") as f:
+            settings = json.load(f)
+
+        forecaster = cls(
+            high_freq_config=high_cfg,
+            low_freq_config=low_cfg,
+            high_freq_cols=settings["high_freq_cols"],
+            low_freq_cols=settings["low_freq_cols"],
+            combine_method=settings["combine_method"],
+            bias_correction=settings["bias_correction"],
+            bias_window_hours=settings["bias_window_hours"],
+            bias_method=settings["bias_method"],
+            output_freq=settings.get("output_freq"),  # Backwards compatible
+        )
 
         # Load component models
-        for i, comp_config in enumerate(config.components):
-            comp_dir = path / f"component_{i}_{comp_config.name}"
+        forecaster._models["high_freq"] = NeuralProphetForecaster.load(path / "high_freq")
+        forecaster._models["low_freq"] = NeuralProphetForecaster.load(path / "low_freq")
 
-            if comp_config.model_type == "prophet":
-                from .prophet import ProphetForecaster
+        forecaster._is_fitted = True
+        return forecaster
 
-                model = ProphetForecaster.load(comp_dir)
-            else:
-                from .neural_prophet import NeuralProphetForecaster
-
-                model = NeuralProphetForecaster.load(comp_dir)
-
-            instance._components.append((comp_config, model))
-
-        instance._is_fitted = True
-        instance._decomposer = instance._create_decomposer()
-
-        return instance
+    def plot_components(self, window_days: float = 7.0) -> None:
+        """Plot each component model separately."""
+        for comp_name, model in self._models.items():
+            print(f"\n{comp_name}:")
+            model.plot(window_days=window_days, title=comp_name)
+            plt.show()
 
     def plot(
         self,
-        df: pd.DataFrame,
         df_test: pd.DataFrame | None = None,
-        window_days: float | None = None,
-        figsize: tuple[float, float] = (14, 6),
+        window_days: float = 7.0,
+        figsize: tuple[float, float] = (14, 10),
+        show_components: bool = True,
+        show_residuals: bool = False,
         title: str | None = None,
-        ax=None,
-    ):
-        """Plot ensemble historical data, fitted values, and forecast.
+    ) -> tuple[plt.Figure, np.ndarray]:
+        """Plot ensemble forecast with component breakdown.
 
-        Shows the historical data with in-sample fitted values and generates
-        a forecast. Optionally overlays actual test data.
+        Creates a multi-panel plot showing:
+        - Top panel: Original signal + combined ensemble forecast
+        - Middle panels: Individual component forecasts (high_freq, low_freq)
+        - Bottom panel (optional): Residuals
 
         Args:
-            df: Historical data with 'ds' and 'y' columns.
-            df_test: Optional test data to overlay actual values on forecast.
-            window_days: Number of days to show. If None, shows all training data.
-            figsize: Figure size as (width, height).
-            title: Custom plot title. If None, uses ensemble name.
-            ax: Optional matplotlib axes to plot on. If None, creates new figure.
+            df_test: Optional test data to overlay actual values
+            window_days: Number of days to display from training end
+            figsize: Figure size as (width, height)
+            show_components: Show individual component forecasts
+            show_residuals: Show residuals panel
+            title: Custom plot title
 
         Returns:
-            matplotlib figure and axes (fig, ax).
+            (fig, axes) tuple
 
         Raises:
-            RuntimeError: If model hasn't been fitted yet.
+            RuntimeError: If model hasn't been fitted
         """
         if not self._is_fitted:
-            raise RuntimeError("Model must be fitted before plotting.")
+            raise RuntimeError("Model has not been fitted yet. Call fit() first.")
 
-        try:
-            import matplotlib.pyplot as plt
-        except ImportError as err:
-            raise ImportError(
-                "matplotlib is required for plotting. Install with: pip install matplotlib"
-            ) from err
-
-        # Get in-sample fitted values
-        fitted = self._get_fitted_values(df)
-
-        # Generate forecast
-        forecast = self.predict(df, periods=self.config.n_forecast)
-
-        # Prepare data for plotting
-        df_plot = df.copy()
-        df_plot["ds"] = pd.to_datetime(df_plot["ds"])
-
-        # Merge fitted values with df_plot
-        df_plot = df_plot.merge(fitted[["ds", "yhat"]], on="ds", how="left")
-
-        # Apply window filter
-        if window_days is not None:
-            cutoff = df_plot["ds"].max() - pd.Timedelta(days=window_days)
-            df_plot = df_plot[df_plot["ds"] >= cutoff]
+        # Determine number of panels
+        n_panels = 1  # Always have main panel
+        if show_components:
+            n_panels += len(self._models)
+        if show_residuals:
+            n_panels += 1
 
         # Create figure
-        if ax is None:
-            fig, ax1 = plt.subplots(figsize=figsize)
-        else:
-            ax1 = ax
-            fig = ax.get_figure()
+        height_ratios = [2] + [1] * (n_panels - 1)
+        fig, axes = plt.subplots(
+            n_panels,
+            1,
+            figsize=figsize,
+            sharex=True,
+            height_ratios=height_ratios,
+        )
 
-        # Plot historical data
-        ax1.plot(df_plot["ds"], df_plot["y"], "k-", lw=1, alpha=0.8, label="Historical data")
+        if n_panels == 1:
+            axes = [axes]
 
-        # Plot fitted values
-        ax1.plot(df_plot["ds"], df_plot["yhat"], "r-", lw=1, alpha=0.8, label="Fitted")
-
-        # Plot forecast
-        forecast_start = df_plot["ds"].max()
-        ax1.axvline(forecast_start, color="gray", linestyle="--", alpha=0.5, label="Forecast start")
-        ax1.plot(forecast["ds"], forecast["yhat"], "b-", lw=2, label="Forecast")
-
-        # Plot uncertainty bands if available
-        if "yhat_lower" in forecast.columns and "yhat_upper" in forecast.columns:
-            ax1.fill_between(
-                forecast["ds"],
-                forecast["yhat_lower"],
-                forecast["yhat_upper"],
-                color="blue",
-                alpha=0.1,
-                label="Uncertainty",
-            )
-
-        # Overlay test data if provided
-        if df_test is not None:
-            df_test_plot = df_test.copy()
-            df_test_plot["ds"] = pd.to_datetime(df_test_plot["ds"])
-            ax1.plot(df_test_plot["ds"], df_test_plot["y"], "g-", lw=2, alpha=0.8, label="Actual")
-
-        ax1.set_ylabel("Temperature (°C)")
-        ax1.set_title(title or f"{self.name} - Ensemble Forecast")
-        ax1.legend(loc="best")
-        ax1.grid(True, alpha=0.3)
-
-        if ax is None:
-            plt.tight_layout()
-
-        return fig, ax1
-
-    def plot_components(
-        self,
-        df: pd.DataFrame,
-        df_test: pd.DataFrame | None = None,
-        window_days: float | None = 7,
-        figsize: tuple[float, float] = (14, 12),
-    ):
-        """Plot each component model in separate panels.
-
-        Creates a panel for each component (high_freq, low_freq, etc.)
-        using each component's own plot() method.
-        The final panel shows the combined ensemble forecast.
-
-        Args:
-            df: Historical data with 'ds' and 'y' columns.
-            df_test: Optional test data to overlay actual values on forecast.
-            window_days: Days to show for each panel. Default 7.
-            figsize: Figure size as (width, height).
-
-        Returns:
-            matplotlib figure and axes array.
-
-        Raises:
-            RuntimeError: If model hasn't been fitted yet.
-        """
-        if not self._is_fitted:
-            raise RuntimeError("Model must be fitted before plotting.")
-
-        try:
-            import matplotlib.pyplot as plt
-        except ImportError as err:
-            raise ImportError(
-                "matplotlib is required for plotting. Install with: pip install matplotlib"
-            ) from err
-
-        n_components = len(self._components)
-        fig, axes = plt.subplots(n_components + 1, 1, figsize=figsize, sharex=False)
-
-        # Plot each component using its own plot() method
-        for i, (comp_config, model) in enumerate(self._components):
-            ax = axes[i]
-
-            # Use component model's plot() method
-            if comp_config.model_type == "prophet":
-                model.plot(
-                    df_test=df_test,
-                    window_days=window_days,
-                    title=f"{comp_config.name} ({comp_config.model_type})",
-                    ax=ax,
-                )
-            else:
-                # NeuralProphet needs df parameter
-                model.plot(
-                    df=model._fit_df if hasattr(model, "_fit_df") else df,
-                    df_test=df_test,
-                    window_days=window_days,
-                    title=f"{comp_config.name} ({comp_config.model_type})",
-                    ax=ax,
-                )
-
-            ax.set_ylabel(f"{comp_config.name} (°C)")
-
-        # Final panel: combined ensemble
-        ax_sum = axes[-1]
-
-        # Get fitted values and forecast
-        fitted = self._get_fitted_values(df)
-        forecast = self.predict(df, periods=self.config.n_forecast)
-
-        # Prepare data for plotting
-        df_plot = df.copy()
-        df_plot["ds"] = pd.to_datetime(df_plot["ds"])
-        df_plot = df_plot.merge(fitted[["ds", "yhat"]], on="ds", how="left")
+        # Get combined fitted values
+        df_fitted = self.fitted(window_days=window_days).sort_values("ds")
 
         # Apply window filter
-        if window_days is not None:
-            cutoff = df_plot["ds"].max() - pd.Timedelta(days=window_days)
-            df_plot = df_plot[df_plot["ds"] >= cutoff]
+        initial_date = self._training_end - pd.Timedelta(days=window_days)
+        end_date = self._training_end + pd.Timedelta(days=1.25)
 
-        # Plot historical data and fitted
-        ax_sum.plot(df_plot["ds"], df_plot["y"], "k-", lw=1, alpha=0.8, label="Historical data")
-        ax_sum.plot(df_plot["ds"], df_plot["yhat"], "r-", lw=1, alpha=0.8, label="Fitted")
+        cutoff = self._training_end - pd.Timedelta(days=int(3 * window_days))
+        df_plot = df_fitted[df_fitted["ds"] >= cutoff].copy()
 
-        # Plot forecast
-        forecast_start = df_plot["ds"].max()
-        ax_sum.axvline(
+        # Separate historical fit from forecast
+        forecast_start = self._training_end
+        df_history = df_plot[df_plot["ds"] <= forecast_start]
+        df_forecast = df_plot[df_plot["ds"] > forecast_start]
+
+        # Panel 0: Main plot
+        ax_main = axes[0]
+
+        if "y" in df_history.columns:
+            ax_main.plot(df_history["ds"], df_history["y"], "k-", lw=1, alpha=0.8, label="Actual")
+
+        ax_main.plot(
+            df_history["ds"], df_history["yhat"], "r-", lw=1, alpha=0.7, label="Fitted (ensemble)"
+        )
+
+        if "yhat_lower" in df_history.columns:
+            ax_main.fill_between(
+                df_history["ds"],
+                df_history["yhat_lower"],
+                df_history["yhat_upper"],
+                color="red",
+                alpha=0.1,
+            )
+
+        ax_main.axvline(
             forecast_start, color="gray", linestyle="--", alpha=0.5, label="Forecast start"
         )
-        ax_sum.plot(forecast["ds"], forecast["yhat"], "b-", lw=2, label="Ensemble forecast")
 
-        # Overlay test data if provided
+        if len(df_forecast) > 0:
+            ax_main.plot(df_forecast["ds"], df_forecast["yhat"], "b-", lw=2, label="Forecast")
+            if "yhat_lower" in df_forecast.columns:
+                ax_main.fill_between(
+                    df_forecast["ds"],
+                    df_forecast["yhat_lower"],
+                    df_forecast["yhat_upper"],
+                    color="blue",
+                    alpha=0.15,
+                )
+
         if df_test is not None:
             df_test_plot = df_test.copy()
             df_test_plot["ds"] = pd.to_datetime(df_test_plot["ds"])
-            ax_sum.plot(
-                df_test_plot["ds"], df_test_plot["y"], "g-", lw=2, alpha=0.8, label="Actual"
+            if df_test_plot["ds"].dt.tz is not None:
+                df_test_plot["ds"] = df_test_plot["ds"].dt.tz_localize(None)
+            df_test_plot = df_test_plot[df_test_plot["ds"] >= cutoff]
+            ax_main.plot(
+                df_test_plot["ds"], df_test_plot["y"], "g-", lw=1.5, alpha=0.8, label="Test actual"
             )
 
-        ax_sum.set_xlabel("Date")
-        ax_sum.set_ylabel("Combined (°C)")
-        ax_sum.set_title(f"Combined Ensemble (last {window_days}d + forecast)")
-        ax_sum.legend(loc="upper right", fontsize=8)
-        ax_sum.grid(True, alpha=0.3)
+        ax_main.set_ylabel("Value")
+        ax_main.set_title(title or f"Ensemble Forecast ({self.name})")
+        ax_main.legend(loc="upper left", fontsize=9)
+        ax_main.grid(True, alpha=0.3)
 
+        # Component panels
+        panel_idx = 1
+        colors = {"high_freq": "#e74c3c", "low_freq": "#3498db"}
+        col_labels = {"high_freq": self._high_freq_cols, "low_freq": self._low_freq_cols}
+
+        if show_components:
+            for comp_name, model in self._models.items():
+                ax = axes[panel_idx]
+                color = colors.get(comp_name, f"C{panel_idx}")
+
+                try:
+                    comp_fitted = model.fitted(window_days=int(3 * window_days)).sort_values("ds")
+                    comp_fitted = comp_fitted[comp_fitted["ds"] >= cutoff]
+
+                    comp_history = comp_fitted[comp_fitted["ds"] <= forecast_start]
+                    comp_forecast = comp_fitted[comp_fitted["ds"] > forecast_start]
+
+                    if "y" in comp_history.columns:
+                        ax.plot(
+                            comp_history["ds"],
+                            comp_history["y"],
+                            "k-",
+                            lw=0.8,
+                            alpha=0.6,
+                            label=f"Actual ({comp_name})",
+                        )
+
+                    ax.plot(
+                        comp_history["ds"],
+                        comp_history["yhat"],
+                        color=color,
+                        lw=1,
+                        alpha=0.8,
+                        label="Fitted",
+                    )
+
+                    if "yhat_lower" in comp_history.columns:
+                        ax.fill_between(
+                            comp_history["ds"],
+                            comp_history["yhat_lower"],
+                            comp_history["yhat_upper"],
+                            color=color,
+                            alpha=0.1,
+                        )
+
+                    ax.axvline(forecast_start, color="gray", linestyle="--", alpha=0.3)
+
+                    if len(comp_forecast) > 0:
+                        ax.plot(
+                            comp_forecast["ds"],
+                            comp_forecast["yhat"],
+                            color=color,
+                            lw=2,
+                            linestyle="-",
+                            label="Forecast",
+                        )
+                        sample_cut = min(len(comp_forecast), int(window_days * 24))
+                        ymean, ystd = (
+                            np.nanmedian(comp_forecast["yhat"].tail(sample_cut)),
+                            np.nanstd(comp_forecast["yhat"]),
+                        )
+                        ymax, ymin = ymean + 3 * ystd, ymean - 3 * ystd
+                        ax.set_ylim(ymin, ymax)
+
+                except Exception as e:
+                    ax.text(
+                        0.5,
+                        0.5,
+                        f"Error plotting {comp_name}: {e}",
+                        transform=ax.transAxes,
+                        ha="center",
+                    )
+
+                cols = col_labels.get(comp_name, [])
+                ax.set_ylabel(f"{comp_name}\n({', '.join(cols)})")
+                ax.legend(loc="upper left", fontsize=8)
+                ax.grid(True, alpha=0.3)
+                ax.axhline(0, color="gray", linestyle="-", alpha=0.2)
+
+                panel_idx += 1
+
+        # Residuals panel
+        if show_residuals and "y" in df_history.columns:
+            ax = axes[panel_idx]
+            residuals = df_history["y"] - df_history["yhat"]
+
+            ax.plot(df_history["ds"], residuals, "g-", lw=0.5, alpha=0.8)
+            ax.axhline(0, color="k", linestyle="-", alpha=0.3)
+            ax.fill_between(
+                df_history["ds"], residuals, 0, where=residuals > 0, color="green", alpha=0.2
+            )
+            ax.fill_between(
+                df_history["ds"], residuals, 0, where=residuals < 0, color="red", alpha=0.2
+            )
+
+            ax.set_ylabel("Residuals")
+            ax.grid(True, alpha=0.3)
+
+            rmse = np.sqrt(np.mean(residuals**2))
+            ax.text(
+                0.02,
+                0.95,
+                f"RMSE: {rmse:.3f}",
+                transform=ax.transAxes,
+                fontsize=9,
+                verticalalignment="top",
+                bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.8},
+            )
+
+        # Final formatting
+        axes[-1].set_xlabel("Date")
+        axes[-1].set_xlim(initial_date, end_date)
         plt.tight_layout()
+
         return fig, axes

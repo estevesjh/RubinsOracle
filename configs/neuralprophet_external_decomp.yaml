@@ -1,13 +1,13 @@
 name: neural_prophet
 lag_days: 1
 n_forecast: 1
-model_dir: outputs/models/default
+model_dir: outputs/models/external_decomp
 
 # Data frequency
 freq: 1h
 freq_per_day: 24
 
-# Seasonality
+# Seasonality - disabled since decomposer handles it
 yearly_seasonality: false
 weekly_seasonality: false
 daily_seasonality: true
@@ -17,27 +17,27 @@ seasonality_mode: additive
 n_changepoints: 12
 changepoints_range: 0.85
 
-# No decomposition
+# No internal decomposition - handled externally by SignalDecomposer
 decomposer:
   method: none
 
 # AR configuration
-ar_layers: []
+ar_layers: [24, 12, 24]
 ar_reg: 1.0
 
 # Trend regularization
 trend_reg: 1.0
 
 # Training
-epochs: 500
+epochs: 100
 batch_size: 64
-learning_rate: 0.1
+learning_rate: 0.075
 loss_func: SmoothL1Loss
 optimizer: AdamW
 
 # Early stopping
 early_stopping: false
-valid_pct: 0.0
+valid_pct: 0.1
 
 # Uncertainty
 quantiles:

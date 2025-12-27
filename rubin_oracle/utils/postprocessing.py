@@ -63,15 +63,15 @@ class PostProcessor:
     def apply_bias_correction(
         forecast_df: pd.DataFrame,
         actual_df: pd.DataFrame,
-        bias_window_hours: float = 6.0,
+        bias_window_rows: int = 6,
         bias_method: str = "median",
     ) -> pd.DataFrame:
         """Apply bias correction based on recent errors.
 
         Args:
-            forecast_df: DataFrame with forecast (columns: ds, yhat, step)
-            actual_df: DataFrame with actuals (columns: ds, y)
-            bias_window_hours: Hours of recent history to use for bias
+            forecast_df: DataFrame with forecast (must have 'yhat' column)
+            actual_df: DataFrame with actuals (must have 'y' column)
+            bias_window_rows: Number of recent rows to use for bias calculation
             bias_method: 'mean' or 'median' for bias calculation
 
         Returns:
@@ -79,28 +79,33 @@ class PostProcessor:
         """
         result = forecast_df.copy()
 
-        # Merge forecast with actuals
-        merged = result.merge(actual_df[["ds", "y"]], on="ds", how="left")
+        if len(actual_df) == 0 or "y" not in actual_df.columns:
+            return result
+        if "yhat" not in result.columns:
+            return result
 
-        # Filter to recent window
-        if len(merged) > 0 and "ds" in merged.columns:
-            latest_time = merged["ds"].max()
-            window_start = latest_time - pd.Timedelta(hours=bias_window_hours)
-            recent = merged[merged["ds"] >= window_start]
+        # Get recent actuals and forecasts by row position (tail)
+        n_rows = min(bias_window_rows, len(actual_df), len(result))
+        if n_rows == 0:
+            return result
 
-            if len(recent) > 0:
-                # Calculate bias (actual - forecast)
-                bias_data = recent.dropna(subset=["y", "yhat"])
-                if len(bias_data) > 0:
-                    residuals = bias_data["y"] - bias_data["yhat"]
+        recent_actual = actual_df["y"].tail(n_rows).values
+        recent_forecast = result["yhat"].head(n_rows).values
 
-                    if bias_method == "median":
-                        bias = residuals.median()
-                    else:  # mean
-                        bias = residuals.mean()
+        # Calculate bias from valid pairs
+        valid_mask = ~(np.isnan(recent_actual) | np.isnan(recent_forecast))
+        if valid_mask.sum() == 0:
+            return result
 
-                    # Apply bias correction
-                    result["yhat"] = result["yhat"] + bias
+        residuals = recent_actual[valid_mask] - recent_forecast[valid_mask]
+
+        if bias_method == "median":
+            bias = np.median(residuals)
+        else:  # mean
+            bias = np.mean(residuals)
+
+        # Apply bias correction
+        result["yhat"] = result["yhat"] + bias
 
         return result
 

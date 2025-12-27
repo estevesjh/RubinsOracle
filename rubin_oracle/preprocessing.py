@@ -15,13 +15,19 @@ Functions:
     preprocess_for_forecast: Convenience function to preprocess data with decomposition
 """
 
+# Suppress Prophet output
+import logging
 import warnings
 from typing import Literal, Optional
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from scipy.signal import butter, savgol_filter, sosfiltfilt
 from statsmodels.tsa.seasonal import STL
+
+logging.getLogger("prophet").setLevel(logging.WARNING)
+logging.getLogger("cmdstanpy").setLevel(logging.WARNING)
 
 # =============================================================================
 # Periodic NaN Fill Functions
@@ -133,6 +139,553 @@ def fill_nan_periodic(
         print(f"Filled {filled_count} NaN values using periodic fill (period={period_days}d)")
 
     return y
+
+
+# =============================================================================
+# Signal Decomposer (sklearn-style wrapper)
+# =============================================================================
+
+
+class SignalDecomposer:
+    """Sklearn-style signal decomposer with forward extension for prediction.
+
+    Training: fit_transform() decomposes directly (full signal available)
+    Prediction: transform() extends forward to avoid edge effects
+
+    Example:
+        >>> decomposer = SignalDecomposer(freq=96, period_pairs=[(0.4, 0.6), (0.8, 1.2)])
+        >>> df_train_dec = decomposer.fit_transform(df_train)
+        >>> df_test_dec = decomposer.transform(df_test)
+    """
+
+    def __init__(
+        self,
+        freq: int = 96,
+        period_pairs: list[tuple[float, float]] | None = None,
+        filter_type: Literal["savgol", "butterworth"] = "savgol",
+        extension_days: float = 2.0,
+        history_buffer_days: float = 14.0,
+        verbose: bool = False,
+        **bandpass_kwargs,
+    ):
+        self.freq = freq
+        self.period_pairs = period_pairs
+        self.filter_type = filter_type
+        self.extension_days = extension_days
+        self.history_buffer_days = max(14.0, history_buffer_days)
+        self.verbose = verbose
+        self.bandpass_kwargs = bandpass_kwargs
+
+        # State (after fit)
+        self.training_end_: pd.Timestamp | None = None
+        self.history_buffer_: pd.DataFrame | None = None
+        self.extension_model_ = None
+        self.is_fitted_: bool = False
+
+    def fit(self, df: pd.DataFrame) -> "SignalDecomposer":
+        """Fit extension model and store history buffer."""
+        df = self._validate_and_sort(df)
+
+        self.training_end_ = df["ds"].max()
+        self._fit_extension_model(df)
+
+        # Store history buffer for continuity at prediction time
+        buffer_samples = int(self.history_buffer_days * self.freq)
+        self.history_buffer_ = df.tail(buffer_samples).copy()
+
+        self.is_fitted_ = True
+        return self
+
+    def fit_transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Fit and decompose training data (no extension needed)."""
+        self.fit(df)
+        return self._decompose(df)
+
+    def transform(self, df: pd.DataFrame, include_history: bool = False) -> pd.DataFrame:
+        """Transform with forward extension.
+
+        Always:
+        1. Prepend history buffer
+        2. Extend forward with Prophet
+        3. Decompose
+        4. Return only requested timestamps
+        """
+        if not self.is_fitted_:
+            raise RuntimeError("Call fit() first")
+
+        df = self._validate_and_sort(df)
+        original_timestamps = df["ds"].copy()
+
+        # 1. Prepend history for filter continuity
+        df_with_history = (
+            pd.concat([self.history_buffer_[["ds", "y"]], df[["ds", "y"]]])
+            .drop_duplicates("ds")
+            .sort_values("ds")
+            .reset_index(drop=True)
+        )
+
+        # 2. Extend forward with Prophet
+        df_extended = self._extend_forward(df_with_history)
+
+        # 3. Decompose
+        df_decomposed = self._decompose(df_extended)
+
+        # 4. Return only requested timestamps
+        if not include_history:
+            result = df_decomposed[df_decomposed["ds"].isin(original_timestamps)]
+        else:
+            result = df_decomposed
+        return result.reset_index(drop=True)
+
+    def _fit_extension_model(self, df: pd.DataFrame) -> None:
+        """Fit Prophet model for forward extension."""
+        try:
+            from prophet import Prophet
+        except ImportError as err:
+            raise ImportError(
+                "Prophet is required for SignalDecomposer. Install with: pip install prophet"
+            ) from err
+
+        # Prepare data for Prophet
+        df_prophet = df[["ds", "y"]].copy()
+
+        # Remove timezone if present
+        if df_prophet["ds"].dt.tz is not None:
+            df_prophet["ds"] = df_prophet["ds"].dt.tz_localize(None)
+
+        # Fit Prophet with custom seasonalities for better sub-daily patterns
+        self.extension_model_ = Prophet(
+            yearly_seasonality=False,
+            weekly_seasonality=False,
+            daily_seasonality=False,
+            changepoint_prior_scale=0.85,
+            n_changepoints=24,
+        )
+
+        # Add custom seasonalities
+        self.extension_model_.add_seasonality(name="12h", period=0.5, fourier_order=12)
+        self.extension_model_.add_seasonality(name="24h", period=1, fourier_order=12)
+        self.extension_model_.add_seasonality(name="48h", period=3.5, fourier_order=7)
+        self.extension_model_.add_seasonality(name="weekly", period=6, fourier_order=7)
+
+        self.extension_model_.fit(df_prophet)
+
+    def _decompose(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Apply bandpass decomposition."""
+        decomposer = BandpassDecomposer(
+            freq=self.freq,
+            period_pairs=self.period_pairs,
+            filter_type=self.filter_type,
+            verbose=self.verbose,
+            **self.bandpass_kwargs,
+        )
+        return decomposer.decompose(df)
+
+    def _extend_forward(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Extend signal forward using Prophet."""
+        df = df.copy()
+        last_ds = df["ds"].max()
+
+        # Generate future timestamps
+        freq_minutes = 1440 // self.freq
+        extension_samples = int(self.extension_days * self.freq)
+        future_dates = pd.date_range(
+            start=last_ds - 3 * pd.Timedelta(minutes=freq_minutes),
+            periods=extension_samples,
+            freq=f"{freq_minutes}min",
+        )
+
+        # Get Prophet forecast
+        future_df = pd.DataFrame({"ds": future_dates})
+        forecast = self.extension_model_.predict(future_df)
+        extension = forecast[["ds", "yhat"]].rename(columns={"yhat": "y"})
+        bias = np.nanmedian(extension.head(3)["y"].to_numpy() - df.tail(3)["y"].to_numpy())
+        extension["y"] -= bias
+
+        return (
+            pd.concat([df, extension], ignore_index=True)
+            .drop_duplicates("ds")
+            .reset_index(drop=True)
+        )
+
+    def _validate_and_sort(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        df["ds"] = pd.to_datetime(df["ds"])
+        if df["ds"].dt.tz is not None:
+            df["ds"] = df["ds"].dt.tz_localize(None)
+        return df.sort_values("ds").reset_index(drop=True)
+
+    def get_feature_names(self) -> list[str]:
+        """Return decomposed column names."""
+        n_bands = len(self.period_pairs or [])
+        return [f"y_band_{i}" for i in range(n_bands)]
+
+    def save(self, path, include_history: bool = False) -> None:
+        """Save decomposer state to file.
+
+        Args:
+            path: Path to save file
+            include_history: If False, drops history_decomposed_ to save space
+        """
+        import pickle
+        from pathlib import Path
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        state = {
+            "freq": self.freq,
+            "period_pairs": self.period_pairs,
+            "filter_type": self.filter_type,
+            "extension_days": self.extension_days,
+            "history_buffer_days": self.history_buffer_days,
+            "verbose": self.verbose,
+            "_bandpass_kwargs": self._bandpass_kwargs,
+            "training_end_": self.training_end_,
+            "history_buffer_": self.history_buffer_,
+            "extension_model_": self.extension_model_,
+            "is_fitted_": self.is_fitted_,
+        }
+
+        if include_history:
+            state["history_decomposed_"] = self.history_decomposed_
+        else:
+            state["history_decomposed_"] = None
+
+        with open(path, "wb") as f:
+            pickle.dump(state, f)
+
+        if self.verbose:
+            print(f"SignalDecomposer saved to {path}")
+            print(f"  Include history: {include_history}")
+
+    @classmethod
+    def load(cls, path) -> "SignalDecomposer":
+        """Load decomposer from file.
+
+        Note: If saved without history, call refit_history() with training data.
+
+        Args:
+            path: Path to saved file
+
+        Returns:
+            Loaded SignalDecomposer instance
+        """
+        import pickle
+        from pathlib import Path
+
+        path = Path(path)
+
+        with open(path, "rb") as f:
+            state = pickle.load(f)
+
+        # Create instance with saved parameters
+        decomposer = cls(
+            freq=state["freq"],
+            period_pairs=state["period_pairs"],
+            filter_type=state["filter_type"],
+            extension_days=state["extension_days"],
+            history_buffer_days=state["history_buffer_days"],
+            verbose=state["verbose"],
+        )
+
+        # Restore state
+        decomposer._bandpass_kwargs = state["_bandpass_kwargs"]
+        decomposer.training_end_ = state["training_end_"]
+        decomposer.history_buffer_ = state["history_buffer_"]
+        decomposer.extension_model_ = state["extension_model_"]
+        decomposer.is_fitted_ = state["is_fitted_"]
+        decomposer.history_decomposed_ = state.get("history_decomposed_")
+
+        # Recreate BandpassDecomposer
+        if decomposer.is_fitted_:
+            decomposer.bandpass_decomposer_ = BandpassDecomposer(**decomposer._bandpass_kwargs)
+
+        return decomposer
+
+    def refit_history(self, df_train: pd.DataFrame) -> None:
+        """Recompute history_decomposed_ after loading.
+
+        Call this after load() if the decomposer was saved without history.
+
+        Args:
+            df_train: Original training data with 'ds' and 'y' columns
+        """
+        if not self.is_fitted_:
+            raise RuntimeError("Decomposer not fitted. Call fit() instead.")
+
+        if self.bandpass_decomposer_ is None:
+            self.bandpass_decomposer_ = BandpassDecomposer(**self._bandpass_kwargs)
+
+        df_train = df_train.copy()
+        df_train["ds"] = pd.to_datetime(df_train["ds"])
+        df_train = df_train.sort_values("ds").reset_index(drop=True)
+
+        self.history_decomposed_ = self.bandpass_decomposer_.decompose(df_train)
+
+        if self.verbose:
+            print(f"History refitted: {len(self.history_decomposed_)} rows")
+
+    def plot(
+        self,
+        df_decomposed: pd.DataFrame,
+        df_extended: pd.DataFrame | None = None,
+        window_days: float = 7.0,
+        show_variance: bool = True,
+        figsize: tuple[float, float] = (14, 10),
+        title: str | None = None,
+    ) -> tuple[plt.Figure, np.ndarray]:
+        """Plot decomposed signal components.
+
+        Args:
+            df_decomposed: Decomposed dataframe from fit_transform() or transform()
+            df_extended: Optional extended dataframe (to show extension region)
+            window_days: Days to plot from the end
+            show_variance: Print variance breakdown
+            figsize: Figure size
+            title: Custom title
+
+        Returns:
+            (fig, axes) tuple
+        """
+        import matplotlib.pyplot as plt
+
+        feature_names = self.get_feature_names()
+        n_components = len(feature_names) + 1  # +1 for original signal
+
+        fig, axes = plt.subplots(n_components, 1, figsize=figsize, sharex=True)
+
+        # Select window
+        n_plot = int(window_days * self.freq)
+        df_plot = df_decomposed.tail(n_plot).copy()
+
+        # Colors for components
+        colors = ["#e74c3c", "#3498db", "#27ae60", "#9b59b6", "#f39c12"]
+
+        # Plot original signal
+        axes[0].plot(df_plot["ds"], df_plot["y"], "k", lw=0.8, label="y")
+        axes[0].set_ylabel("Original")
+        axes[0].set_title(title or "Signal Decomposition", fontsize=14)
+
+        # If extension provided, show extended region
+        if df_extended is not None:
+            # Extension starts after df_decomposed ends
+            ext_start = df_decomposed["ds"].max()
+            df_ext_plot = df_extended[df_extended["ds"] > ext_start]
+            if len(df_ext_plot) > 0:
+                axes[0].axvline(
+                    ext_start, color="red", linestyle="--", alpha=0.7, label="Extension start"
+                )
+                axes[0].plot(
+                    df_ext_plot["ds"], df_ext_plot["y"], "r--", lw=0.8, alpha=0.6, label="Extension"
+                )
+
+        axes[0].legend(loc="upper right", fontsize=8)
+
+        # Plot each component
+        for i, col in enumerate(feature_names):
+            ax = axes[i + 1]
+            color = colors[i % len(colors)]
+            ax.plot(df_plot["ds"], df_plot[col], color=color, lw=0.8)
+            ax.set_ylabel(col)
+            ax.axhline(0, color="gray", linestyle="--", alpha=0.3)
+
+            # Show extension for components too
+            if df_extended is not None and col in df_extended.columns:
+                df_ext_plot = df_extended[df_extended["ds"] > ext_start]
+                if len(df_ext_plot) > 0:
+                    ax.plot(
+                        df_ext_plot["ds"],
+                        df_ext_plot[col],
+                        color=color,
+                        linestyle="--",
+                        lw=0.8,
+                        alpha=0.5,
+                    )
+
+        axes[-1].set_xlabel("Date")
+
+        for ax in axes:
+            ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        # Variance breakdown
+        if show_variance:
+            print("\nVariance breakdown:")
+            total_var = df_decomposed["y"].var()
+            for col in feature_names:
+                var = df_decomposed[col].var()
+                pct = var / total_var * 100 if total_var > 0 else 0
+                print(f"  {col}: {var:.4f} ({pct:.1f}%)")
+
+            # Reconstruction error
+            reconstructed = sum(df_decomposed[col] for col in feature_names)
+            residual_var = (df_decomposed["y"] - reconstructed).var()
+            print(f"  residual: {residual_var:.4f} ({residual_var / total_var * 100:.1f}%)")
+
+        return fig, axes
+
+    def plot_transform(
+        self,
+        df_test: pd.DataFrame,
+        window_days: float = 7.0,
+        show_variance: bool = True,
+        figsize: tuple[float, float] = (14, 10),
+    ) -> tuple[plt.Figure, np.ndarray]:
+        """Transform and plot, showing the extension region.
+
+        Convenience method that runs transform and visualizes the result
+        including the forward extension used to avoid edge effects.
+
+        Args:
+            df_test: Test data with 'ds' and 'y' columns
+            window_days: Days to plot
+            show_variance: Print variance breakdown
+            figsize: Figure size
+
+        Returns:
+            (fig, axes) tuple
+        """
+        if not self.is_fitted_:
+            raise RuntimeError("Call fit() first")
+
+        df_test = self._validate_and_sort(df_test)
+        original_timestamps = df_test["ds"].copy()
+
+        # Build extended signal (same as transform, but keep extension)
+        df_with_history = (
+            pd.concat([self.history_buffer_[["ds", "y"]], df_test[["ds", "y"]]])
+            .drop_duplicates("ds")
+            .sort_values("ds")
+            .reset_index(drop=True)
+        )
+
+        df_extended = self._extend_forward(df_with_history)
+        df_decomposed_full = self._decompose(df_extended)
+
+        # Get result for original timestamps
+        df_decomposed = df_decomposed_full[
+            df_decomposed_full["ds"].isin(original_timestamps)
+        ].reset_index(drop=True)
+
+        # Get extension portion for plotting
+        extension_start = df_test["ds"].max()
+        df_extension = df_decomposed_full[df_decomposed_full["ds"] > extension_start]
+        print(df_decomposed_full.columns)
+        return self.plot(
+            df_decomposed=df_decomposed,
+            df_extended=df_extension,
+            window_days=window_days,
+            show_variance=show_variance,
+            figsize=figsize,
+            title=f"Signal Decomposition (with {self.extension_days}d extension)",
+        )
+
+
+# =============================================================================
+# High/Low Frequency Decomposer
+# =============================================================================
+
+
+class HighLowFreqDecomposer(SignalDecomposer):
+    """Decomposer extracting sub-daily, daily, and low-frequency components.
+
+    A specialized SignalDecomposer with fixed frequency bands that extracts:
+    - y_high_12h: Sub-daily component (period 0.1-0.8 days = 2.4-19.2 hours)
+    - y_high_24h: ~24-hour component (period 0.8-1.2 days = 19.2-28.8 hours)
+    - y_low_freq: Residual (y - y_high_12h - y_high_24h) containing multi-day trends + noise
+
+    Example:
+        >>> decomposer = HighLowFreqDecomposer(freq=96, extension_days=2.0)
+        >>> df_train_decomposed = decomposer.fit_transform(df_train)
+        >>> # df_train_decomposed has columns: ds, y, y_high_12h, y_high_24h, y_low_freq
+    """
+
+    def __init__(
+        self,
+        freq: int = 96,
+        extension_days: float = 2.0,
+        history_buffer_days: float = 14.0,
+        verbose: bool = False,
+        filter_type: Literal["savgol", "butterworth"] = "savgol",
+        **kwargs,
+    ):
+        """Initialize the HighLowFreqDecomposer.
+
+        Args:
+            freq: Observations per day (96 for 15-min data)
+            extension_days: Days to extend forward for edge effect mitigation
+            history_buffer_days: Minimum days of history to keep
+            verbose: Print progress messages
+            **kwargs: Additional parameters passed to BandpassDecomposer
+        """
+        # Fixed period pairs for sub-daily and daily bands
+        period_pairs = [
+            (0.1, 3.0),  # Sub-daily (2.4-19.2 hours)
+            (3.0, 7.0),  # ~24h band (19.2-30.0 hours)
+            (7.0, 30.0),  # ~24h band (19.2-30.0 hours)
+        ]
+        super().__init__(
+            freq=freq,
+            period_pairs=period_pairs,
+            extension_days=extension_days,
+            history_buffer_days=history_buffer_days,
+            verbose=verbose,
+            **kwargs,
+        )
+
+        # Column name mapping
+        self._column_map = {
+            "y_band_1": "y_high_12h",
+            "y_band_0": "y_high_24h",
+            "y_band_2": "trend",
+        }
+
+    def fit_transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Fit and transform, renaming columns and computing residual.
+
+        Args:
+            df: Training data with 'ds' and 'y' columns
+
+        Returns:
+            DataFrame with ds, y, y_high_12h, y_high_24h, y_low_freq columns
+        """
+        result = super().fit_transform(df)
+        result = self._rename_and_add_residual(result)
+        result.drop(columns=["trend"], inplace=True)
+        return result
+
+    def transform(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Transform, renaming columns and computing residual.
+
+        Args:
+            df: Data with 'ds' and 'y' columns
+
+        Returns:
+            DataFrame with ds, y, y_high_12h, y_high_24h, y_low_freq columns
+        """
+        result = super().transform(df)
+        return self._rename_and_add_residual(result)
+
+    def _rename_and_add_residual(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Rename band columns and compute y_low_freq residual."""
+        df = df.rename(columns=self._column_map)
+        window_size = self.freq // 4
+        # df["y_low_freq"] = savgol_filter(
+        #     df["y"] - df["y_high_12h"] - df["y_high_24h"], window_size, 3
+        # )
+        df["y_low_freq"] = savgol_filter(df["y"] - df["y_high_24h"], window_size, 3)
+        return df
+
+    def get_feature_names(self) -> list[str]:
+        """Return semantic column names.
+
+        Returns:
+            List of feature column names: ['y_high_12h', 'y_high_24h', 'y_low_freq']
+        """
+        return ["y_high_24h", "y_low_freq"]
+        # return ["y_high_12h", "y_high_24h", "y_low_freq"]
 
 
 # =============================================================================
@@ -653,6 +1206,10 @@ class BandpassDecomposer:
                 df[f"y_{name}"] = self._apply_butterworth_bandpass(
                     y_filled, spec["lowcut"], spec["highcut"], name, pad_length, is_trend=is_trend
                 )
+
+        yall = np.array([df[f"y_{spec['name']}"].to_numpy() for spec in self._filter_specs[:-1]])
+        window_length = int(self._filter_specs[-1]["period_low_days"])
+        df[f"y_{name}"] = savgol_filter(df["y"] - np.sum(yall, axis=0), window_length, 3)
 
         if self.mode == "drop":
             component_cols = [f"y_{spec['name']}" for spec in self._filter_specs]

@@ -19,10 +19,6 @@ import torch
 
 from rubin_oracle.base import ValidationMixin
 from rubin_oracle.config import NeuralProphetConfig
-from rubin_oracle.preprocessing import (
-    BandpassDecomposer,
-    RubinVMDDecomposer,
-)
 from rubin_oracle.utils import (
     MetricsCalculator,
     OutputFormatter,
@@ -99,7 +95,6 @@ class NeuralProphetForecaster(ValidationMixin):
         self.config = config
         self.name = "neural_prophet"
         self.model_: NeuralProphet | None = None
-        self._decomposer: BandpassDecomposer | RubinVMDDecomposer | None = None
         self._regressor_cols: list[str] = []
         self._training_window_size: int | None = None
 
@@ -109,57 +104,6 @@ class NeuralProphetForecaster(ValidationMixin):
             lag_days=config.lag_days,
             n_forecast=config.n_forecast,
         )
-
-    def _decompose(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Apply signal decomposition based on config.
-
-        Args:
-            df: DataFrame with 'ds' and 'y' columns
-
-        Returns:
-            DataFrame with decomposed component columns added
-        """
-        if self.config.decomposer.method == "none":
-            return df
-
-        if self._decomposer is None:
-            cfg = self.config.decomposer
-
-            if cfg.method == "bandpass":
-                self._decomposer = BandpassDecomposer(
-                    freq=cfg.freq,
-                    period_pairs=cfg.period_pairs,
-                    filter_type=cfg.filter_type,
-                    # Pre-filter edge padding
-                    edge_method=cfg.edge_method,
-                    edge_pad_periods=cfg.edge_pad_periods,
-                    # Post-filter edge correction
-                    pad_method=cfg.pad_method,
-                    pad_num_periods=cfg.pad_num_periods,
-                    pad_max_periods=cfg.pad_max_periods,
-                    pad_target_periods=cfg.pad_target_periods,
-                    pad_arima_order=cfg.pad_arima_order,
-                    pad_bands=cfg.pad_bands,
-                    # NaN handling
-                    nan_fill=cfg.nan_fill,
-                    nan_fill_period=cfg.nan_fill_period,
-                    nan_fill_max_gap=cfg.nan_fill_max_gap,
-                    # Filter parameters
-                    savgol_polyorder=cfg.savgol_polyorder,
-                    butter_order=cfg.butter_order,
-                    verbose=cfg.verbose,
-                )
-            elif cfg.method == "vmd":
-                self._decomposer = RubinVMDDecomposer(
-                    freq=cfg.freq,
-                    alpha=cfg.alpha,
-                    K_stage1=cfg.K_stage1,
-                    K_stage2=cfg.K_stage2,
-                    verbose=cfg.verbose,
-                    include_residual=cfg.include_residual,
-                )
-
-        return self._decomposer.decompose(df)
 
     def _add_time_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Add cyclic time features (hour of day, day of year).
@@ -177,6 +121,10 @@ class NeuralProphetForecaster(ValidationMixin):
     def _get_regressor_columns(self, df: pd.DataFrame) -> list[str]:
         """Get decomposed component and time feature columns to use as regressors.
 
+        Auto-detects decomposed columns from the dataframe, supporting both
+        internal decomposition (use_decomposition=True) and external decomposition
+        (SignalDecomposer/HighLowFreqDecomposer).
+
         Args:
             df: DataFrame with decomposed columns and time features
 
@@ -185,15 +133,18 @@ class NeuralProphetForecaster(ValidationMixin):
         """
         valid_cols = []
 
-        # Add decomposed component columns
-        if self.config.use_decomposition:
-            candidate_cols = [c for c in df.columns if c.startswith("y_") and c not in ["y_trend"]]
+        # Auto-detect decomposed component columns by pattern
+        # Supports: y_band_*, y_high_*, y_low_*, y_vmd_*, y_subdaily, y_imf*
+        decomp_patterns = ["y_band_", "y_high_", "y_low_", "y_vmd_", "y_subdaily", "y_imf"]
+        candidate_cols = [
+            c for c in df.columns if any(c.startswith(p) for p in decomp_patterns) and c != "y"
+        ]
 
-            # Filter by variance threshold to remove near-constant features
-            variance_threshold = 1e-6
-            for col in candidate_cols:
-                if col in df.columns and df[col].var() > variance_threshold:
-                    valid_cols.append(col)
+        # Filter by variance threshold to remove near-constant features
+        variance_threshold = 1e-6
+        for col in candidate_cols:
+            if col in df.columns and df[col].var() > variance_threshold:
+                valid_cols.append(col)
 
         # Add time features if present
         time_features = ["hour_sin", "hour_cos", "doy_sin", "doy_cos"]
@@ -208,6 +159,7 @@ class NeuralProphetForecaster(ValidationMixin):
         df: pd.DataFrame,
         window_size: int | None = None,
         verbose: bool = False,
+        regressors: list[str] | None = None,
     ) -> NeuralProphetForecaster:
         """Fit the NeuralProphet model to training data.
 
@@ -215,8 +167,12 @@ class NeuralProphetForecaster(ValidationMixin):
             df: Training data with columns:
                 - ds (datetime): Timestamps
                 - y (float): Target values
+                - Optional decomposed columns (y_band_*, y_high_*, etc.)
             window_size: Optional limit on training data size (most recent N samples)
             verbose: Whether to print training progress
+            regressors: Explicit list of regressor column names to use as lagged regressors.
+                If provided, these columns are used instead of auto-detection.
+                Example: decomposer.get_feature_names()
 
         Returns:
             Self for method chaining
@@ -224,6 +180,7 @@ class NeuralProphetForecaster(ValidationMixin):
         Raises:
             ValueError: If data is invalid or insufficient
         """
+        self._explicit_regressors = regressors
         # Validate input
         df = validate_input(df)
 
@@ -248,18 +205,23 @@ class NeuralProphetForecaster(ValidationMixin):
             print(f"Training data: {len(df)} samples")
             print(f"Date range: {df['ds'].min()} to {df['ds'].max()}")
 
-        # Apply decomposition if configured
-        if self.config.use_decomposition:
-            df = self._decompose(df)
+        # Note: Decomposition is now handled externally by SignalDecomposer
+        # The forecaster expects df to already have decomposed columns if use_decomposition=True
 
         # Add time features (hour of day, day of year) if enabled
         if self.config.use_time_features:
             df = self._add_time_features(df)
 
-        # Get regressor columns (decomposition + time features)
-        self._regressor_cols = self._get_regressor_columns(df)
+        # Get regressor columns: use explicit list if provided, otherwise auto-detect
+        if self._explicit_regressors is not None:
+            self._regressor_cols = [c for c in self._explicit_regressors if c in df.columns]
+        else:
+            self._regressor_cols = self._get_regressor_columns(df)
+
         if verbose:
             print(f"Regressor columns: {len(self._regressor_cols)}")
+            if self._regressor_cols:
+                print(f"  {self._regressor_cols}")
 
         # Prepare data for NeuralProphet
         cols_to_keep = ["ds", "y"] + self._regressor_cols
@@ -291,6 +253,7 @@ class NeuralProphetForecaster(ValidationMixin):
             optimizer=self.config.optimizer,
             quantiles=self.config.quantiles,
             ar_layers=self.config.ar_layers if self.config.ar_layers else [],
+            # accelerator="cpu",
         )
 
         # Add custom seasonalities if defined
@@ -328,11 +291,18 @@ class NeuralProphetForecaster(ValidationMixin):
             df: Training data with 'ds' and 'y' columns
         """
         if self.model_ is None:
+            warnings.warn(
+                "Cannot compute metrics because the NeuralProphet model is not fitted. "
+                "Call fit() before requesting metrics.",
+                stacklevel=1,
+            )
             self.metrics_ = None
             return
 
         if df is None:
-            merged = self.fitted(window_days=14)
+            # Use at least lag_days to ensure enough samples for prediction
+            window = max(14, self.config.lag_days)
+            merged = self.fitted(window_days=window)
         else:
             # Get in-sample predictions (fitted values)
             fitted = self.forecast(df, include_historical_data=True)
@@ -436,17 +406,10 @@ class NeuralProphetForecaster(ValidationMixin):
         if df_test["ds"].dt.tz is not None:
             df_test["ds"] = df_test["ds"].dt.tz_convert(None)
 
-        if self._decompose is not None:
-            start_date = (self.latest_timestamp).tz_convert(None)
-            test_date_min = df_test["ds"].min()
-            if test_date_min > self._fit_df["ds"].min():
-                history = self._fit_df[self._fit_df["ds"] <= start_date]
-                df_test_up = df_test[df_test["ds"] >= start_date]
-                df_input = pd.concat([history, df_test_up])
-            else:
-                df_input = df_test
+        # Note: Decomposition is now handled externally by SignalDecomposer
+        # The forecaster expects df_test to already have decomposed columns
 
-        elif include_history:
+        if include_history:
             test_date_min = df_test["ds"].min()
             lag_days = self.config.lag_days + window_days
             start_date = (self.latest_timestamp - pd.Timedelta(days=lag_days)).tz_convert(None)
@@ -530,19 +493,19 @@ class NeuralProphetForecaster(ValidationMixin):
                 f"Please provide a DataFrame with at least {self.config.lag_days} observations."
             )
 
-        # Prepare the input data (validate, decompose, add time features, regularize frequency)
+        # Prepare the input data (validate, add time features, regularize frequency)
+        # Note: Decomposition is now handled externally by SignalDecomposer
         df_model = self._prepare_df(
             df=df,
             regressor_cols=self._regressor_cols,
             config=self.config,
-            decomposer=self._decomposer,
         )
 
         # Use most recent data needed for AR (autoregressive)
         # Keep: lag_samples (for looking back) + n_forecast_samples (for rolling window) + buffer
         n_needed = self._converter.lag_samples + self._converter.n_forecast_samples
 
-        if (not include_history) and (not self._decompose):
+        if not include_history:
             if len(df_model) > n_needed:
                 df_model = df_model.tail(n_needed).copy()
 
@@ -590,13 +553,15 @@ class NeuralProphetForecaster(ValidationMixin):
             forecast, self.config.freq, self._converter.n_forecast_samples
         )
 
-    def save(self, path: str | Path) -> None:
+    def save(self, path: str | Path, decomposer=None) -> None:
         """Save the fitted NeuralProphet model to disk.
 
-        Saves the model, configuration, and metadata.
+        Saves the model, configuration, metadata, and optionally the decomposer.
 
         Args:
             path: Directory path where model will be saved
+            decomposer: Optional SignalDecomposer to save alongside the model.
+                       If provided, saves without history_decomposed_ to reduce size.
 
         Raises:
             RuntimeError: If model hasn't been fitted yet
@@ -620,6 +585,10 @@ class NeuralProphetForecaster(ValidationMixin):
         }
         with open(path / "metadata.json", "w") as f:
             json.dump(metadata, f)
+
+        # Save decomposer if provided (without history to save space)
+        if decomposer is not None:
+            decomposer.save(path / "decomposer.pkl", include_history=False)
 
     @classmethod
     def load(cls, path: str | Path) -> NeuralProphetForecaster:
@@ -659,80 +628,59 @@ class NeuralProphetForecaster(ValidationMixin):
             forecaster._regressor_cols = metadata.get("regressor_cols", [])
             forecaster._training_window_size = metadata.get("training_window_size")
 
-        # Recreate decomposer if decomposition was used
-        if config.use_decomposition:
-            cfg = config.decomposer
-            if cfg.method == "bandpass":
-                forecaster._decomposer = BandpassDecomposer(
-                    freq=cfg.freq,
-                    period_pairs=cfg.period_pairs,
-                    filter_type=cfg.filter_type,
-                    # Pre-filter edge padding
-                    edge_method=cfg.edge_method,
-                    edge_pad_periods=cfg.edge_pad_periods,
-                    # Post-filter edge correction
-                    pad_method=cfg.pad_method,
-                    pad_num_periods=cfg.pad_num_periods,
-                    pad_max_periods=cfg.pad_max_periods,
-                    pad_target_periods=cfg.pad_target_periods,
-                    pad_arima_order=cfg.pad_arima_order,
-                    pad_bands=cfg.pad_bands,
-                    # NaN handling
-                    nan_fill=cfg.nan_fill,
-                    nan_fill_period=cfg.nan_fill_period,
-                    nan_fill_max_gap=cfg.nan_fill_max_gap,
-                    # Filter parameters
-                    savgol_polyorder=cfg.savgol_polyorder,
-                    butter_order=cfg.butter_order,
-                    verbose=cfg.verbose,
-                )
-            elif cfg.method == "vmd":
-                forecaster._decomposer = RubinVMDDecomposer(
-                    freq=cfg.freq,
-                    alpha=cfg.alpha,
-                    K_stage1=cfg.K_stage1,
-                    K_stage2=cfg.K_stage2,
-                    verbose=cfg.verbose,
-                    include_residual=cfg.include_residual,
-                )
+        # Note: Decomposer is now loaded separately via load_decomposer()
+        # Decomposition is handled externally by SignalDecomposer
 
         return forecaster
+
+    @staticmethod
+    def load_decomposer(path: str | Path):
+        """Load a SignalDecomposer from a saved model directory.
+
+        Note: The loaded decomposer will not have history_decomposed_.
+        Call decomposer.refit_history(df_train) after loading to restore it.
+
+        Args:
+            path: Directory path where model was saved
+
+        Returns:
+            Loaded SignalDecomposer instance, or None if not found
+        """
+        from rubin_oracle.preprocessing import SignalDecomposer
+
+        path = Path(path)
+        decomposer_path = path / "decomposer.pkl"
+
+        if not decomposer_path.exists():
+            return None
+
+        return SignalDecomposer.load(decomposer_path)
 
     @staticmethod
     def _prepare_df(
         df: pd.DataFrame,
         regressor_cols: list[str],
         config,
-        decomposer=None,
     ) -> pd.DataFrame:
         """Prepare input dataframe for NeuralProphet prediction.
 
         Common preprocessing for both fitted() and forecast() methods.
-        Handles: validation, decomposition, time features, frequency regularization,
+        Handles: validation, time features, frequency regularization,
         missing value imputation.
 
-        Skips decomposition and time feature addition if already applied to avoid
-        reprocessing and creating NaN values in regressor columns.
+        Note: Decomposition is now handled externally by SignalDecomposer.
+        The input df is expected to already have decomposed columns if needed.
 
         Args:
-            df: Raw input dataframe with 'ds' and 'y' columns
+            df: Input dataframe with 'ds', 'y', and optionally decomposed columns
             regressor_cols: List of regressor column names to include
             config: NeuralProphetConfig object with settings
-            decomposer: Optional decomposer instance for signal decomposition
 
         Returns:
             Prepared dataframe with proper columns and frequency
         """
         # Validate and prepare input
         df = validate_input(df)
-
-        # Check if decomposition has already been applied
-        # (indicated by presence of decomposed component columns like y_trend, y_c0, etc.)
-        has_decomposed_cols = any(col.startswith("y_") for col in df.columns if col != "y")
-
-        # Apply decomposition only if decomposer is provided and not already applied
-        if decomposer is not None and not has_decomposed_cols:
-            df = decomposer.decompose(df)
 
         # Check if time features have already been added
         has_time_features = all(

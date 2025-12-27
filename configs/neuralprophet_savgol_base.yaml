@@ -4,7 +4,7 @@ n_forecast: 1
 model_dir: outputs/models/savgol_base
 
 # Data frequency
-freq: 15min
+freq: 30min
 freq_per_day: 96
 
 # Seasonality
@@ -62,8 +62,8 @@ trend_reg: 1.0
 
 # Training
 epochs: 120
-batch_size: 150
-learning_rate: 0.005
+batch_size: 64
+learning_rate: 0.075
 loss_func: SmoothL1Loss
 optimizer: AdamW
 
